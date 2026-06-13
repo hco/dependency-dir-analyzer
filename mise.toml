@@ -1,0 +1,61 @@
+# mise configuration — https://mise.jdx.dev
+#
+# `mise` is used both as a dependency manager (it installs the toolchains
+# declared under [tools]) and as the task runner for this project. Run
+# `mise tasks` to list everything, or `mise run <task>`.
+
+[tools]
+# The Rust toolchain is installed and pinned by mise. `components` ensures
+# clippy and rustfmt are installed too (mise's default rust profile is minimal
+# and ships neither), so `mise run lint` and `mise run fmt-check` work. Bump the
+# version when you want a newer compiler.
+rust = { version = "1.88", components = "rustfmt,clippy" }
+
+[env]
+# Keep cargo's output inside the repo so caching in CI is straightforward.
+CARGO_TERM_COLOR = "always"
+
+[tasks.build]
+description = "Build the debug binary"
+run = "cargo build"
+
+[tasks.release]
+description = "Build the optimized release binary"
+run = "cargo build --release"
+
+[tasks.run]
+description = "Run the CLI (pass args after --, e.g. `mise run run -- ~/code`)"
+run = "cargo run --"
+
+[tasks.test]
+description = "Run the test suite"
+run = "cargo test"
+
+[tasks.fmt]
+description = "Format the code"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check formatting without modifying files"
+run = "cargo fmt --all --check"
+
+[tasks.lint]
+description = "Run clippy with warnings denied"
+run = "cargo clippy --all-targets --all-features -- -D warnings"
+
+[tasks.check]
+description = "Type-check without producing a binary"
+run = "cargo check --all-targets"
+
+# A single entry point that mirrors what CI runs.
+[tasks.ci]
+description = "Run the full CI suite: format check, lint, test, build"
+depends = ["fmt-check", "lint", "test", "release"]
+
+[tasks.clean]
+description = "Remove build artifacts"
+run = "cargo clean"
+
+[tasks.install]
+description = "Install the binary into mise's shims (cargo install from source)"
+run = "cargo install --path ."

@@ -1,0 +1,54 @@
+name: Release
+
+# Cut a release by pushing a semver tag, e.g.:
+#   git tag v0.1.0 && git push origin v0.1.0
+# This builds binaries for Linux, macOS and Windows and attaches them to a
+# GitHub Release for the tag. You can also trigger it manually for testing.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build (e.g. v0.1.0). Used for the archive name."
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-apple-darwin
+            os: macos-13
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the binary for the target, archive it (tar.gz on Unix, zip on
+      # Windows), generate a SHA-256 checksum, and upload everything to the
+      # GitHub Release for the pushed tag (creating the release if needed).
+      # This action transparently handles Linux cross-compilation.
+      - name: Build and upload release binary
+        uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: dda
+          target: ${{ matrix.target }}
+          archive: dependency-dir-analyzer-$tag-$target
+          checksum: sha256
+          # On manual runs there is no tag ref, so fall back to the input.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || '' }}
+          token: ${{ secrets.GITHUB_TOKEN }}
