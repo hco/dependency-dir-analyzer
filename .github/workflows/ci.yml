@@ -24,10 +24,19 @@ jobs:
       - uses: actions/checkout@v4
 
       # mise installs the toolchain declared in mise.toml and exposes the tasks.
+      #
+      # Caching is intentionally disabled here. mise installs Rust as a *symlink*
+      # to a rustup-managed toolchain, and the rustfmt/clippy components declared
+      # in mise.toml live under ~/.rustup (outside the cached ~/.local/share/mise
+      # directory). When the mise cache is restored, `mise install` sees the tool
+      # as already present and skips it, so the components never get re-added and
+      # `cargo fmt`/`cargo clippy` fail. A fresh install every run reliably pulls
+      # the components in; the expensive crate/target caching is handled by
+      # rust-cache below.
       - name: Set up mise
         uses: jdx/mise-action@v2
         with:
-          cache: true
+          cache: false
 
       # Cache the cargo registry and target dir for faster builds.
       - name: Cache cargo
