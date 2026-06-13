@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 
 /// Scan a directory tree for dependency directories and report how much space
 /// they use.
@@ -8,7 +9,12 @@ use clap::{Parser, ValueEnum};
 /// A "dependency directory" is a folder that a package manager or build tool
 /// generates and that can usually be regenerated from source (for example
 /// `node_modules`, `target`, `.venv` or `vendor`). This tool finds them,
-/// totals their size and shows you where your disk space went.
+/// totals their size, shows when each was last touched, and helps you reclaim
+/// disk space.
+///
+/// Run without arguments to scan the current directory in an interactive,
+/// live-updating terminal UI. Pipe the output or pass `--format json|csv` for
+/// machine-readable results.
 #[derive(Debug, Parser)]
 #[command(name = "dda", version, about, long_about = None)]
 pub struct Cli {
@@ -16,7 +22,8 @@ pub struct Cli {
     #[arg(default_value = ".")]
     pub path: PathBuf,
 
-    /// Output format.
+    /// Output format. `table` shows an interactive TUI on a terminal (or a
+    /// plain table when piped); `json` and `csv` are always machine-readable.
     #[arg(short, long, value_enum, default_value_t = Format::Table)]
     pub format: Format,
 
@@ -32,17 +39,42 @@ pub struct Cli {
     #[arg(long)]
     pub follow_symlinks: bool,
 
-    /// Do not print the summary footer (table format only).
+    /// Print a plain static table instead of the interactive TUI, even on a
+    /// terminal.
+    #[arg(long)]
+    pub plain: bool,
+
+    /// Do not print the summary footer (plain table / non-interactive output).
     #[arg(long)]
     pub no_summary: bool,
+
+    /// Generate shell completion scripts and other utilities.
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Print a shell completion script to stdout.
+    ///
+    /// Example (bash):  `dda completions bash > /etc/bash_completion.d/dda`
+    /// Example (zsh):   `dda completions zsh  > "${fpath[1]}/_dda"`
+    /// Example (fish):  `dda completions fish > ~/.config/fish/completions/dda.fish`
+    Completions {
+        /// Shell to generate completions for.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Format {
-    /// Human-readable, aligned columns.
+    /// Interactive TUI on a terminal, or an aligned plain table when piped.
     Table,
     /// Machine-readable JSON.
     Json,
+    /// Machine-readable CSV.
+    Csv,
 }
 
 /// Parse a human-friendly size string such as `10MB`, `1.5GiB` or `500k` into
@@ -118,5 +150,11 @@ mod tests {
         assert!(parse_size("abc").is_err());
         assert!(parse_size("10XB").is_err());
         assert!(parse_size("-5MB").is_err());
+    }
+
+    #[test]
+    fn verifies_cli() {
+        use clap::CommandFactory;
+        Cli::command().debug_assert();
     }
 }
