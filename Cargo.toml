@@ -1,0 +1,32 @@
+[package]
+name = "dependency-dir-analyzer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Scan a directory tree for dependency directories (node_modules, target, .venv, …) and report how much space they use."
+authors = ["Hans-Christian Otto"]
+license = "MIT"
+repository = "https://github.com/hco/dependency-dir-analyzer"
+readme = "README.md"
+keywords = ["cli", "disk-usage", "dependencies", "node_modules", "cleanup"]
+categories = ["command-line-utilities", "filesystem"]
+
+# The binary is named `dda` for convenience; the crate keeps the descriptive name.
+[[bin]]
+name = "dda"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+humansize = "2.1"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+walkdir = "2.5"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
