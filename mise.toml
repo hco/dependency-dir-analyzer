@@ -5,9 +5,11 @@
 # `mise tasks` to list everything, or `mise run <task>`.
 
 [tools]
-# The Rust toolchain (rustc, cargo, clippy, rustfmt) is installed and pinned by
-# mise. Bump this when you want a newer compiler.
-rust = "1.88"
+# The Rust toolchain is installed and pinned by mise. `components` ensures
+# clippy and rustfmt are installed too (mise's default rust profile is minimal
+# and ships neither), so `mise run lint` and `mise run fmt-check` work. Bump the
+# version when you want a newer compiler.
+rust = { version = "1.88", components = "rustfmt,clippy" }
 
 [env]
 # Keep cargo's output inside the repo so caching in CI is straightforward.
