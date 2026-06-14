@@ -3,10 +3,11 @@
 //! The scan runs on a background thread and streams [`ScanEvent`]s back over a
 //! channel; the UI thread drains them every tick, so dependency directories
 //! appear as soon as they are discovered and their sizes fill in as the
-//! parallel sizing completes. The user can scroll, re-sort, and quit; on exit
-//! the final sorted results are returned so the caller can leave a static
-//! summary in the terminal scrollback.
+//! parallel sizing completes. The user can scroll, re-sort, group by ecosystem,
+//! filter, and quit; on exit the final largest-first results are returned so the
+//! caller can leave a static summary in the terminal scrollback.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, TryRecvError};
 use std::thread;
@@ -15,7 +16,9 @@ use std::time::{Duration, SystemTime};
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row as TableRow, Table, TableState, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState, Wrap,
+};
 use ratatui::DefaultTerminal;
 
 use crate::report::{human_size, relative_age};
@@ -67,6 +70,13 @@ impl Row {
             Row::Done(d) => &d.path,
         }
     }
+
+    fn ecosystem(&self) -> &'static str {
+        match self {
+            Row::Pending { ecosystem, .. } => ecosystem,
+            Row::Done(d) => d.ecosystem,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +107,115 @@ impl SortKey {
     }
 }
 
+/// Minimum-size threshold cycler applied on top of the CLI `--min-size`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeFilter {
+    All,
+    Mb1,
+    Mb10,
+    Mb100,
+    Gb1,
+}
+
+impl SizeFilter {
+    fn next(self) -> Self {
+        match self {
+            SizeFilter::All => SizeFilter::Mb1,
+            SizeFilter::Mb1 => SizeFilter::Mb10,
+            SizeFilter::Mb10 => SizeFilter::Mb100,
+            SizeFilter::Mb100 => SizeFilter::Gb1,
+            SizeFilter::Gb1 => SizeFilter::All,
+        }
+    }
+
+    fn min_bytes(self) -> u64 {
+        match self {
+            SizeFilter::All => 0,
+            SizeFilter::Mb1 => 1_000_000,
+            SizeFilter::Mb10 => 10_000_000,
+            SizeFilter::Mb100 => 100_000_000,
+            SizeFilter::Gb1 => 1_000_000_000,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SizeFilter::All => "all",
+            SizeFilter::Mb1 => "≥1 MB",
+            SizeFilter::Mb10 => "≥10 MB",
+            SizeFilter::Mb100 => "≥100 MB",
+            SizeFilter::Gb1 => "≥1 GB",
+        }
+    }
+}
+
+/// "Modified older than" threshold cycler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgeFilter {
+    Any,
+    Day1,
+    Week1,
+    Month1,
+    Month6,
+    Year1,
+}
+
+impl AgeFilter {
+    fn next(self) -> Self {
+        match self {
+            AgeFilter::Any => AgeFilter::Day1,
+            AgeFilter::Day1 => AgeFilter::Week1,
+            AgeFilter::Week1 => AgeFilter::Month1,
+            AgeFilter::Month1 => AgeFilter::Month6,
+            AgeFilter::Month6 => AgeFilter::Year1,
+            AgeFilter::Year1 => AgeFilter::Any,
+        }
+    }
+
+    /// Minimum age in seconds a directory must have to pass, or `None` for "any".
+    fn min_age_secs(self) -> Option<u64> {
+        const DAY: u64 = 86_400;
+        match self {
+            AgeFilter::Any => None,
+            AgeFilter::Day1 => Some(DAY),
+            AgeFilter::Week1 => Some(7 * DAY),
+            AgeFilter::Month1 => Some(30 * DAY),
+            AgeFilter::Month6 => Some(182 * DAY),
+            AgeFilter::Year1 => Some(365 * DAY),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            AgeFilter::Any => "any",
+            AgeFilter::Day1 => ">1d",
+            AgeFilter::Week1 => ">1w",
+            AgeFilter::Month1 => ">1mo",
+            AgeFilter::Month6 => ">6mo",
+            AgeFilter::Year1 => ">1y",
+        }
+    }
+}
+
+/// A modal overlay drawn on top of the table; only one can be open at a time.
+enum Overlay {
+    None,
+    Help,
+    Ecosystems { cursor: usize },
+}
+
+/// One rendered line of the table: an ecosystem group header (only when
+/// grouping is on) or an actual directory row.
+enum DisplayItem<'a> {
+    Header {
+        ecosystem: &'static str,
+        total: u64,
+        count: usize,
+        collapsed: bool,
+    },
+    Data(&'a Row),
+}
+
 struct App {
     root: PathBuf,
     rows: Vec<Row>,
@@ -104,6 +223,16 @@ struct App {
     last_warning: Option<String>,
     scanning: bool,
     sort: SortKey,
+    group: bool,
+    size_filter: SizeFilter,
+    age_filter: AgeFilter,
+    /// Ecosystems the user has toggled *off* in the ecosystem panel. Empty means
+    /// every ecosystem is shown.
+    disabled_ecos: HashSet<&'static str>,
+    /// Ecosystems whose group is collapsed (header shown, rows hidden). Only has
+    /// an effect while grouping is on.
+    collapsed_ecos: HashSet<&'static str>,
+    overlay: Overlay,
     spinner: usize,
     top: usize,
     min_size: u64,
@@ -119,6 +248,12 @@ impl App {
             last_warning: None,
             scanning: true,
             sort: SortKey::Size,
+            group: false,
+            size_filter: SizeFilter::All,
+            age_filter: AgeFilter::Any,
+            disabled_ecos: HashSet::new(),
+            collapsed_ecos: HashSet::new(),
+            overlay: Overlay::None,
             spinner: 0,
             top,
             min_size,
@@ -185,31 +320,110 @@ impl App {
 
     /// Returns `true` when the app should quit.
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        let visible = self.visible_len();
+        // Ctrl-C always quits, regardless of any open overlay.
+        if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
+            return true;
+        }
+
+        match self.overlay {
+            Overlay::Help => {
+                // Any key dismisses the help dialog.
+                self.overlay = Overlay::None;
+                false
+            }
+            Overlay::Ecosystems { .. } => {
+                self.handle_eco_key(code);
+                false
+            }
+            Overlay::None => self.handle_main_key(code),
+        }
+    }
+
+    fn handle_main_key(&mut self, code: KeyCode) -> bool {
+        let len = self.visible_len();
         match code {
             KeyCode::Char('q') | KeyCode::Esc => return true,
-            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return true,
-            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1, visible),
-            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1, visible),
-            KeyCode::PageDown => self.move_selection(10, visible),
-            KeyCode::PageUp => self.move_selection(-10, visible),
-            KeyCode::Home | KeyCode::Char('g') => {
-                if visible > 0 {
-                    self.state.select(Some(0));
+            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+            KeyCode::PageDown => self.move_selection(10),
+            KeyCode::PageUp => self.move_selection(-10),
+            KeyCode::Home => self.select_first(),
+            KeyCode::End => {
+                if len > 0 {
+                    self.move_selection(len as isize);
                 }
             }
-            KeyCode::End | KeyCode::Char('G') => {
-                if visible > 0 {
-                    self.state.select(Some(visible - 1));
-                }
-            }
+            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_collapse(),
             KeyCode::Char('s') => self.sort = self.sort.next(),
+            KeyCode::Char('g') => self.group = !self.group,
+            KeyCode::Char('f') => self.size_filter = self.size_filter.next(),
+            KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
+            KeyCode::Char('e') => self.overlay = Overlay::Ecosystems { cursor: 0 },
+            KeyCode::Char('r') => self.reset_filters(),
+            KeyCode::Char('?') => self.overlay = Overlay::Help,
             _ => {}
         }
         false
     }
 
-    fn move_selection(&mut self, delta: isize, len: usize) {
+    fn handle_eco_key(&mut self, code: KeyCode) {
+        let ecos = self.ecosystems_present();
+        let Overlay::Ecosystems { cursor } = &mut self.overlay else {
+            return;
+        };
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('e') => {
+                self.overlay = Overlay::None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !ecos.is_empty() {
+                    *cursor = (*cursor + 1).min(ecos.len() - 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                *cursor = cursor.saturating_sub(1);
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(&eco) = ecos.get(*cursor) {
+                    if !self.disabled_ecos.remove(eco) {
+                        self.disabled_ecos.insert(eco);
+                    }
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Toggle all: if anything is disabled, enable everything;
+                // otherwise disable everything.
+                if self.disabled_ecos.is_empty() {
+                    self.disabled_ecos.extend(ecos.iter().copied());
+                } else {
+                    self.disabled_ecos.clear();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn reset_filters(&mut self) {
+        self.group = false;
+        self.size_filter = SizeFilter::All;
+        self.age_filter = AgeFilter::Any;
+        self.disabled_ecos.clear();
+        self.collapsed_ecos.clear();
+    }
+
+    fn select_first(&mut self) {
+        let select = if self.visible_len() > 0 {
+            Some(0)
+        } else {
+            None
+        };
+        self.state.select(select);
+    }
+
+    /// Move the selection by `delta` rows. Every displayed item — including
+    /// group headers, so they can be folded — is selectable.
+    fn move_selection(&mut self, delta: isize) {
+        let len = self.visible_len();
         if len == 0 {
             self.state.select(None);
             return;
@@ -219,36 +433,117 @@ impl App {
         self.state.select(Some(next));
     }
 
-    /// Build the ordered list of rows to display this frame: completed rows
-    /// (filtered by `min_size`, sorted by the active key, capped by `top`)
-    /// followed by any still-pending rows while the scan is running.
-    fn visible(&self) -> Vec<&Row> {
-        let mut done: Vec<&Row> = self
+    /// Fold or unfold the group whose header is selected (no-op otherwise).
+    fn toggle_collapse(&mut self) {
+        let Some(sel) = self.state.selected() else {
+            return;
+        };
+        let eco = match self.display_items(now()).get(sel) {
+            Some(DisplayItem::Header { ecosystem, .. }) => *ecosystem,
+            _ => return,
+        };
+        if !self.collapsed_ecos.remove(eco) {
+            self.collapsed_ecos.insert(eco);
+        }
+    }
+
+    /// Whether a completed directory passes the active filters.
+    fn passes(&self, d: &DependencyDir, now: SystemTime) -> bool {
+        d.size_bytes >= self.min_size
+            && d.size_bytes >= self.size_filter.min_bytes()
+            && !self.disabled_ecos.contains(d.ecosystem)
+            && self.age_passes(d.modified, now)
+    }
+
+    fn age_passes(&self, modified: Option<SystemTime>, now: SystemTime) -> bool {
+        match self.age_filter.min_age_secs() {
+            None => true,
+            Some(min) => match modified {
+                Some(m) => now
+                    .duration_since(m)
+                    .map(|d| d.as_secs() >= min)
+                    .unwrap_or(false),
+                None => false,
+            },
+        }
+    }
+
+    /// Build the ordered list of items to render this frame. When grouping is
+    /// off this is just the filtered, sorted, top-capped directory rows followed
+    /// by any still-pending rows. When grouping is on, rows are bucketed by
+    /// ecosystem (groups ordered by total size) with a subtotal header each.
+    fn display_items(&self, now: SystemTime) -> Vec<DisplayItem> {
+        let done: Vec<&Row> = self
             .rows
             .iter()
-            .filter(|r| match r {
-                Row::Done(d) => d.size_bytes >= self.min_size,
-                Row::Pending { .. } => false,
-            })
+            .filter(|r| matches!(r, Row::Done(d) if self.passes(d, now)))
             .collect();
 
-        done.sort_by(|a, b| match (a, b) {
-            (Row::Done(a), Row::Done(b)) => self.compare(a, b),
-            _ => std::cmp::Ordering::Equal,
+        // Pending rows are only shown while scanning, and only filtered by the
+        // ecosystem toggle (their size/age aren't known yet).
+        let pending: Vec<&Row> = if self.scanning {
+            self.rows
+                .iter()
+                .filter(|r| {
+                    matches!(r, Row::Pending { ecosystem, .. } if !self.disabled_ecos.contains(ecosystem))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        if !self.group {
+            let mut done = done;
+            done.sort_by(|a, b| match (a, b) {
+                (Row::Done(a), Row::Done(b)) => self.compare(a, b),
+                _ => std::cmp::Ordering::Equal,
+            });
+            if self.top > 0 && done.len() > self.top {
+                done.truncate(self.top);
+            }
+            let mut items: Vec<DisplayItem> = done.into_iter().map(DisplayItem::Data).collect();
+            items.extend(pending.into_iter().map(DisplayItem::Data));
+            return items;
+        }
+
+        // Grouped: bucket every row by its ecosystem.
+        let mut groups: HashMap<&'static str, Vec<&Row>> = HashMap::new();
+        for r in done.into_iter().chain(pending) {
+            groups.entry(r.ecosystem()).or_default().push(r);
+        }
+
+        // Order the groups by their done-size subtotal, largest first.
+        let mut ordered: Vec<(&'static str, Vec<&Row>)> = groups.into_iter().collect();
+        for (_, rows) in &mut ordered {
+            rows.sort_by(|a, b| match (a, b) {
+                (Row::Done(a), Row::Done(b)) => self.compare(a, b),
+                (Row::Done(_), Row::Pending { .. }) => std::cmp::Ordering::Less,
+                (Row::Pending { .. }, Row::Done(_)) => std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            });
+        }
+        ordered.sort_by(|a, b| {
+            group_total(&b.1)
+                .cmp(&group_total(&a.1))
+                .then_with(|| a.0.cmp(b.0))
         });
 
-        if self.top > 0 && done.len() > self.top {
-            done.truncate(self.top);
+        let mut items = Vec::new();
+        for (eco, rows) in ordered {
+            let total = group_total(&rows);
+            let count = rows.iter().filter(|r| matches!(r, Row::Done(_))).count();
+            let collapsed = self.collapsed_ecos.contains(eco);
+            items.push(DisplayItem::Header {
+                ecosystem: eco,
+                total,
+                count,
+                collapsed,
+            });
+            if !collapsed {
+                items.extend(rows.into_iter().map(DisplayItem::Data));
+            }
         }
-
-        if self.scanning {
-            done.extend(
-                self.rows
-                    .iter()
-                    .filter(|r| matches!(r, Row::Pending { .. })),
-            );
-        }
-        done
+        items
     }
 
     fn compare(&self, a: &DependencyDir, b: &DependencyDir) -> std::cmp::Ordering {
@@ -268,12 +563,15 @@ impl App {
         ord.then_with(|| a.path.cmp(&b.path))
     }
 
+    /// Number of selectable rows in the current view (data rows plus, when
+    /// grouping, the group headers).
     fn visible_len(&self) -> usize {
-        self.visible().len()
+        self.display_items(now()).len()
     }
 
     /// The completed, filtered, sorted-by-size results to hand back to the
-    /// caller when the UI exits.
+    /// caller when the UI exits. The interactive sort/group/filters are
+    /// view-only and deliberately do not affect this list.
     fn final_results(&self) -> Vec<DependencyDir> {
         let mut done: Vec<DependencyDir> = self
             .rows
@@ -290,17 +588,31 @@ impl App {
         done
     }
 
+    /// Ecosystems present among the discovered rows, sorted and deduplicated.
+    fn ecosystems_present(&self) -> Vec<&'static str> {
+        let mut ecos: Vec<&'static str> = self.rows.iter().map(|r| r.ecosystem()).collect();
+        ecos.sort_unstable();
+        ecos.dedup();
+        ecos
+    }
+
     fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(3),
+            Constraint::Length(4),
         ])
         .split(frame.area());
 
         self.draw_header(frame, chunks[0]);
         self.draw_table(frame, chunks[1]);
         self.draw_footer(frame, chunks[2]);
+
+        match self.overlay {
+            Overlay::Help => self.draw_help(frame),
+            Overlay::Ecosystems { cursor } => self.draw_eco_panel(frame, cursor),
+            Overlay::None => {}
+        }
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -338,9 +650,9 @@ impl App {
         frame.render_widget(para, area);
     }
 
-    fn draw_table(&mut self, frame: &mut Frame, area: Rect) {
-        // Clamp the selection to the current list before borrowing it for the
-        // frame (this borrow of `self` ends with the statement).
+    /// Ensure the current selection points at a valid row, snapping it back into
+    /// range when the view has shrunk (e.g. after a filter change or a fold).
+    fn clamp_selection(&mut self) {
         let len = self.visible_len();
         match self.state.selected() {
             _ if len == 0 => self.state.select(None),
@@ -348,12 +660,19 @@ impl App {
             None => self.state.select(Some(0)),
             _ => {}
         }
+    }
 
-        let visible = self.visible();
+    fn draw_table(&mut self, frame: &mut Frame, area: Rect) {
+        // Clamp the selection first so the borrow below stays immutable.
+        self.clamp_selection();
 
-        if visible.is_empty() {
+        let items = self.display_items(now());
+
+        if items.is_empty() {
             let msg = if self.scanning {
                 "Scanning…".to_string()
+            } else if self.has_filters() {
+                "No directories match the active filters. Press r to reset.".to_string()
             } else {
                 format!(
                     "No dependency directories found under {}.",
@@ -372,10 +691,10 @@ impl App {
             return;
         }
 
-        let max_size = visible
+        let max_size = items
             .iter()
-            .filter_map(|r| match r {
-                Row::Done(d) => Some(d.size_bytes),
+            .filter_map(|it| match it {
+                DisplayItem::Data(Row::Done(d)) => Some(d.size_bytes),
                 _ => None,
             })
             .max()
@@ -384,34 +703,12 @@ impl App {
         // Bar column width derives from the available area.
         let bar_width = (area.width as usize).saturating_sub(64).clamp(6, 24);
 
-        let rows = visible.iter().map(|row| match row {
-            Row::Done(d) => {
-                let frac = if max_size > 0 {
-                    d.size_bytes as f64 / max_size as f64
-                } else {
-                    0.0
-                };
-                let color = size_color(frac);
-                TableRow::new(vec![
-                    Cell::from(human_size(d.size_bytes)).style(Style::new().fg(color).bold()),
-                    Cell::from(build_bar(frac, bar_width)).style(Style::new().fg(color)),
-                    Cell::from(d.file_count.to_string()).style(Style::new().fg(Color::Gray)),
-                    Cell::from(relative_age(d.modified))
-                        .style(Style::new().fg(age_color(d.modified))),
-                    Cell::from(d.ecosystem).style(Style::new().fg(Color::Cyan)),
-                    Cell::from(self.display_path(&d.path)),
-                ])
-            }
-            Row::Pending { path, ecosystem } => TableRow::new(vec![
-                Cell::from(format!("{} sizing…", SPINNER[self.spinner]))
-                    .style(Style::new().fg(Color::DarkGray)),
-                Cell::from(build_bar(0.0, bar_width)),
-                Cell::from("—").style(Style::new().fg(Color::DarkGray)),
-                Cell::from("—").style(Style::new().fg(Color::DarkGray)),
-                Cell::from(*ecosystem).style(Style::new().fg(Color::DarkGray)),
-                Cell::from(self.display_path(path)).style(Style::new().fg(Color::DarkGray)),
-            ]),
-        });
+        // Collect into an owned Vec so the immutable borrow of `self`/`items`
+        // ends before the table is rendered with `&mut self.state` below.
+        let rows: Vec<TableRow> = items
+            .iter()
+            .map(|it| self.render_item(it, max_size, bar_width))
+            .collect();
 
         let header = TableRow::new(vec![
             Cell::from("Size"),
@@ -446,23 +743,92 @@ impl App {
         frame.render_stateful_widget(table, area, &mut self.state);
     }
 
+    fn render_item(
+        &self,
+        item: &DisplayItem,
+        max_size: u64,
+        bar_width: usize,
+    ) -> TableRow<'static> {
+        match item {
+            DisplayItem::Header {
+                ecosystem,
+                total,
+                count,
+                collapsed,
+            } => {
+                let glyph = if *collapsed { "▸" } else { "▾" };
+                TableRow::new(vec![
+                    Cell::from(human_size(*total)).style(Style::new().fg(Color::White).bold()),
+                    Cell::from(""),
+                    Cell::from(format!("{count} dir{}", if *count == 1 { "" } else { "s" }))
+                        .style(Style::new().fg(Color::Gray)),
+                    Cell::from(""),
+                    Cell::from(format!("{glyph} {ecosystem}"))
+                        .style(Style::new().fg(Color::Cyan).bold()),
+                    Cell::from(""),
+                ])
+                .style(Style::new().bg(Color::Rgb(28, 30, 42)))
+            }
+            DisplayItem::Data(Row::Done(d)) => {
+                let frac = if max_size > 0 {
+                    d.size_bytes as f64 / max_size as f64
+                } else {
+                    0.0
+                };
+                let color = size_color(frac);
+                let indent = if self.group { "  " } else { "" };
+                TableRow::new(vec![
+                    Cell::from(human_size(d.size_bytes)).style(Style::new().fg(color).bold()),
+                    Cell::from(build_bar(frac, bar_width)).style(Style::new().fg(color)),
+                    Cell::from(d.file_count.to_string()).style(Style::new().fg(Color::Gray)),
+                    Cell::from(relative_age(d.modified))
+                        .style(Style::new().fg(age_color(d.modified))),
+                    Cell::from(d.ecosystem).style(Style::new().fg(Color::Cyan)),
+                    Cell::from(format!("{indent}{}", self.display_path(&d.path))),
+                ])
+            }
+            DisplayItem::Data(Row::Pending { path, ecosystem }) => TableRow::new(vec![
+                Cell::from(format!("{} sizing…", SPINNER[self.spinner]))
+                    .style(Style::new().fg(Color::DarkGray)),
+                Cell::from(build_bar(0.0, bar_width)),
+                Cell::from("—").style(Style::new().fg(Color::DarkGray)),
+                Cell::from("—").style(Style::new().fg(Color::DarkGray)),
+                Cell::from(*ecosystem).style(Style::new().fg(Color::DarkGray)),
+                Cell::from(self.display_path(path)).style(Style::new().fg(Color::DarkGray)),
+            ]),
+        }
+    }
+
+    fn has_filters(&self) -> bool {
+        self.size_filter != SizeFilter::All
+            || self.age_filter != AgeFilter::Any
+            || !self.disabled_ecos.is_empty()
+    }
+
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+        let now = now();
         let sized = self
             .rows
             .iter()
             .filter(|r| matches!(r, Row::Done(_)))
             .count();
+        let items = self.display_items(now);
+        let shown = items
+            .iter()
+            .filter(|it| matches!(it, DisplayItem::Data(_)))
+            .count();
+        // Total reflects what is currently shown (filtered), so the header chip
+        // tracks the reclaimable space for the active view.
         let total: u64 = self
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if d.size_bytes >= self.min_size => Some(d.size_bytes),
+                Row::Done(d) if self.passes(d, now) => Some(d.size_bytes),
                 _ => None,
             })
             .sum();
-        let shown = self.visible_len();
 
-        let mut spans = vec![
+        let mut chips = vec![
             Span::styled(
                 format!(" {} ", human_size(total)),
                 Style::new().bg(Color::Green).fg(Color::Black).bold(),
@@ -474,28 +840,160 @@ impl App {
             ),
             Span::raw("   "),
             Span::styled(
-                format!("sort: {}", self.sort.label()),
+                format!("sort:{}", self.sort.label()),
                 Style::new().fg(Color::Magenta),
             ),
+            Span::raw("  "),
+            Span::styled(
+                format!("group:{}", if self.group { "eco" } else { "off" }),
+                Style::new().fg(if self.group {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }),
+            ),
         ];
+        chips.push(Span::raw("  "));
+        chips.push(filter_chip(
+            "size",
+            self.size_filter.label(),
+            self.size_filter != SizeFilter::All,
+        ));
+        chips.push(Span::raw("  "));
+        chips.push(filter_chip(
+            "age",
+            self.age_filter.label(),
+            self.age_filter != AgeFilter::Any,
+        ));
+        if !self.disabled_ecos.is_empty() {
+            chips.push(Span::raw("  "));
+            chips.push(Span::styled(
+                format!("eco:−{}", self.disabled_ecos.len()),
+                Style::new().fg(Color::Yellow),
+            ));
+        }
         if self.warnings > 0 {
-            spans.push(Span::raw("   "));
-            spans.push(Span::styled(
-                format!("⚠ {} warning(s)", self.warnings),
+            chips.push(Span::raw("  "));
+            chips.push(Span::styled(
+                format!("⚠ {}", self.warnings),
                 Style::new().fg(Color::Yellow),
             ));
         }
 
         let hints = Line::from(vec![Span::styled(
-            "↑/↓ move   s sort   g/G top/bottom   q quit",
+            "↑/↓ move   s sort   g group   ↵ fold   f size   a age   e ecosystem   r reset   ? help   q quit",
             Style::new().fg(Color::DarkGray),
         )]);
 
-        let text = Text::from(vec![Line::from(spans), hints]);
+        let text = Text::from(vec![Line::from(chips), hints]);
         let para = Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::new().fg(Color::DarkGray)),
+        );
+        frame.render_widget(para, area);
+    }
+
+    fn draw_help(&self, frame: &mut Frame) {
+        let lines = vec![
+            help_line("↑ / ↓ , j / k", "move selection"),
+            help_line("PgUp / PgDn", "jump 10 rows"),
+            help_line("Home / End", "first / last row"),
+            Line::raw(""),
+            help_line("s", "cycle sort (size · modified · name · files)"),
+            help_line("g", "toggle grouping by ecosystem"),
+            help_line("Enter / Space", "fold/unfold selected group"),
+            help_line("f", "cycle minimum-size filter"),
+            help_line("a", "cycle \"modified older than\" filter"),
+            help_line("e", "open ecosystem filter (multi-select)"),
+            help_line("r", "reset all filters & grouping"),
+            Line::raw(""),
+            help_line("?", "toggle this help"),
+            help_line("q / Esc", "quit"),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Modified colour: green = recent · red = old",
+                Style::new().fg(Color::DarkGray).italic(),
+            )),
+        ];
+
+        let area = centered_rect(frame.area(), 60, lines.len() as u16 + 2);
+        frame.render_widget(Clear, area);
+        let para = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Keyboard shortcuts ",
+                    Style::new().fg(Color::Cyan).bold(),
+                ))
+                .style(Style::new().bg(Color::Rgb(20, 22, 32))),
+        );
+        frame.render_widget(para, area);
+    }
+
+    fn draw_eco_panel(&self, frame: &mut Frame, cursor: usize) {
+        let ecos = self.ecosystems_present();
+
+        let lines: Vec<Line> = if ecos.is_empty() {
+            vec![Line::from(Span::styled(
+                "No ecosystems discovered yet…",
+                Style::new().fg(Color::Gray),
+            ))]
+        } else {
+            ecos.iter()
+                .enumerate()
+                .map(|(i, eco)| {
+                    let enabled = !self.disabled_ecos.contains(eco);
+                    let marker = if i == cursor { "▶ " } else { "  " };
+                    let check = if enabled { "[x]" } else { "[ ]" };
+                    let row_style = if i == cursor {
+                        Style::new().bg(Color::Rgb(40, 40, 55)).bold()
+                    } else {
+                        Style::new()
+                    };
+                    Line::from(vec![
+                        Span::styled(marker, Style::new().fg(Color::Cyan)),
+                        Span::styled(
+                            format!("{check} "),
+                            Style::new().fg(if enabled {
+                                Color::Green
+                            } else {
+                                Color::DarkGray
+                            }),
+                        ),
+                        Span::styled(
+                            *eco,
+                            Style::new().fg(if enabled {
+                                Color::White
+                            } else {
+                                Color::DarkGray
+                            }),
+                        ),
+                    ])
+                    .style(row_style)
+                })
+                .collect()
+        };
+
+        let mut content = lines;
+        content.push(Line::raw(""));
+        content.push(Line::from(Span::styled(
+            "space toggle · a all/none · Esc close",
+            Style::new().fg(Color::DarkGray).italic(),
+        )));
+
+        let area = centered_rect(frame.area(), 46, content.len() as u16 + 2);
+        frame.render_widget(Clear, area);
+        let para = Paragraph::new(content).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Cyan))
+                .title(Span::styled(
+                    " Filter by ecosystem ",
+                    Style::new().fg(Color::Cyan).bold(),
+                ))
+                .style(Style::new().bg(Color::Rgb(20, 22, 32))),
         );
         frame.render_widget(para, area);
     }
@@ -508,6 +1006,53 @@ impl App {
             Ok(rel) => rel.display().to_string(),
             Err(_) => path.display().to_string(),
         }
+    }
+}
+
+fn now() -> SystemTime {
+    SystemTime::now()
+}
+
+/// Sum of the done-row sizes in a group (pending rows contribute nothing).
+fn group_total(rows: &[&Row]) -> u64 {
+    rows.iter()
+        .filter_map(|r| match r {
+            Row::Done(d) => Some(d.size_bytes),
+            _ => None,
+        })
+        .sum()
+}
+
+/// A small `label:value` chip for the footer, highlighted when the filter is
+/// active.
+fn filter_chip(label: &str, value: &str, active: bool) -> Span<'static> {
+    let style = if active {
+        Style::new().fg(Color::Black).bg(Color::Yellow).bold()
+    } else {
+        Style::new().fg(Color::DarkGray)
+    };
+    Span::styled(format!(" {label}:{value} "), style)
+}
+
+fn help_line(keys: &'static str, desc: &'static str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("  {keys:<16}"), Style::new().fg(Color::Cyan).bold()),
+        Span::styled(desc, Style::new().fg(Color::Gray)),
+    ])
+}
+
+/// A rectangle of the given width-percentage and fixed `height`, centred within
+/// `area` (clamped so it always fits).
+fn centered_rect(area: Rect, percent_x: u16, height: u16) -> Rect {
+    let width = (area.width * percent_x / 100).clamp(20, area.width);
+    let height = height.min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    Rect {
+        x,
+        y,
+        width,
+        height,
     }
 }
 
@@ -547,8 +1092,8 @@ fn size_color(frac: f64) -> Color {
     Color::Rgb(r, g, 70)
 }
 
-/// Colour the age column: stale directories (good cleanup candidates) trend
-/// green, recently-touched ones red.
+/// Colour the age column on a green→red scale: recently-modified directories are
+/// green and old ones are red.
 fn age_color(modified: Option<SystemTime>) -> Color {
     let Some(modified) = modified else {
         return Color::DarkGray;
@@ -558,10 +1103,11 @@ fn age_color(modified: Option<SystemTime>) -> Color {
         .map(|d| d.as_secs() / 86_400)
         .unwrap_or(0);
     match days {
-        0..=6 => Color::Red,
-        7..=29 => Color::Yellow,
-        30..=89 => Color::Rgb(180, 200, 120),
-        _ => Color::Green,
+        0..=6 => Color::Rgb(80, 220, 100),    // fresh — green
+        7..=29 => Color::Rgb(160, 210, 90),   // lime
+        30..=89 => Color::Rgb(220, 200, 80),  // yellow
+        90..=364 => Color::Rgb(230, 150, 60), // orange
+        _ => Color::Rgb(230, 80, 70),         // old — red
     }
 }
 
@@ -590,5 +1136,78 @@ mod tests {
         assert_eq!(k, SortKey::Modified);
         k = k.next().next().next();
         assert_eq!(k, SortKey::Size);
+    }
+
+    #[test]
+    fn size_filter_cycles_and_thresholds_increase() {
+        let mut f = SizeFilter::All;
+        assert_eq!(f.min_bytes(), 0);
+        f = f.next();
+        assert_eq!(f, SizeFilter::Mb1);
+        // Cycling all the way around returns to All.
+        let back = f.next().next().next().next();
+        assert_eq!(back, SizeFilter::All);
+    }
+
+    #[test]
+    fn age_filter_older_than_semantics() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0);
+        app.age_filter = AgeFilter::Month1;
+        // Modified 60 days ago passes ">1mo"; 1 day ago does not.
+        let old = Some(now - Duration::from_secs(60 * 86_400));
+        let recent = Some(now - Duration::from_secs(86_400));
+        assert!(app.age_passes(old, now));
+        assert!(!app.age_passes(recent, now));
+        // Unknown timestamps are excluded while an age filter is active.
+        assert!(!app.age_passes(None, now));
+        // With no age filter, everything (including unknown) passes.
+        app.age_filter = AgeFilter::Any;
+        assert!(app.age_passes(None, now));
+    }
+
+    fn done_row(eco: &'static str, name: &'static str, size: u64) -> Row {
+        Row::Done(DependencyDir {
+            path: PathBuf::from(format!("/tmp/{name}")),
+            ecosystem: eco,
+            name,
+            size_bytes: size,
+            file_count: 1,
+            modified: None,
+        })
+    }
+
+    #[test]
+    fn collapsing_a_group_hides_only_its_rows() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0);
+        app.scanning = false;
+        app.group = true;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        app.rows.push(done_row("Rust / Maven", "target", 200));
+
+        let count = |app: &App| {
+            let items = app.display_items(now());
+            let headers = items
+                .iter()
+                .filter(|it| matches!(it, DisplayItem::Header { .. }))
+                .count();
+            let data = items
+                .iter()
+                .filter(|it| matches!(it, DisplayItem::Data(_)))
+                .count();
+            (headers, data)
+        };
+
+        // Two groups, each with its single directory shown.
+        assert_eq!(count(&app), (2, 2));
+
+        // Collapsing one group keeps both headers but hides that group's row.
+        app.collapsed_ecos.insert("Rust / Maven");
+        assert_eq!(count(&app), (2, 1));
+
+        // Reset restores everything.
+        app.reset_filters();
+        assert!(!app.group);
+        assert_eq!(count(&app), (0, 2));
     }
 }
