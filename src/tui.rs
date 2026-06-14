@@ -108,6 +108,22 @@ enum Overlay {
     },
 }
 
+/// The result of trying to remove one directory, sent back from the worker
+/// thread as it goes so the UI can update without blocking.
+enum DeleteOutcome {
+    Removed { path: PathBuf, size: u64 },
+    Failed { path: PathBuf, error: String },
+}
+
+/// Live state of an in-flight deletion, driving the progress modal.
+struct DeleteProgress {
+    done: usize,
+    total: usize,
+    reclaimed: u64,
+    failures: usize,
+    permanent: bool,
+}
+
 /// One rendered line of the table: an ecosystem group header (only when
 /// grouping is on) or an actual directory row.
 enum DisplayItem<'a> {
@@ -144,6 +160,11 @@ struct App {
     /// Transient one-line status shown in the footer after an action (e.g. the
     /// result of a deletion). Cleared the next time the selection changes.
     action: Option<String>,
+    /// While a deletion is running it happens on a worker thread; outcomes stream
+    /// back over this channel so the UI stays responsive. `Some` iff a deletion
+    /// is in flight, paired with `delete_progress`.
+    delete_rx: Option<mpsc::Receiver<DeleteOutcome>>,
+    delete_progress: Option<DeleteProgress>,
     overlay: Overlay,
     spinner: usize,
     top: usize,
@@ -167,6 +188,8 @@ impl App {
             collapsed_ecos: view.collapsed_ecos,
             selected: HashSet::new(),
             action: None,
+            delete_rx: None,
+            delete_progress: None,
             overlay: Overlay::None,
             spinner: 0,
             top,
@@ -194,6 +217,7 @@ impl App {
     ) -> Result<()> {
         loop {
             self.drain(&rx);
+            self.drain_deletion();
 
             terminal.draw(|frame| self.draw(frame))?;
 
@@ -246,9 +270,15 @@ impl App {
 
     /// Returns `true` when the app should quit.
     fn handle_key(&mut self, code: KeyCode, mods: KeyModifiers) -> bool {
-        // Ctrl-C always quits, regardless of any open overlay.
+        // Ctrl-C always quits, regardless of any open overlay or in-flight work.
         if mods.contains(KeyModifiers::CONTROL) && code == KeyCode::Char('c') {
             return true;
+        }
+
+        // While a deletion is running the UI is read-only: swallow every other
+        // key so nothing races the worker thread (or quits mid-delete).
+        if self.delete_progress.is_some() {
+            return false;
         }
 
         match self.overlay {
@@ -310,8 +340,8 @@ impl App {
         };
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                self.perform_deletion(permanent);
                 self.overlay = Overlay::None;
+                self.start_deletion(permanent);
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = Overlay::None;
@@ -525,47 +555,96 @@ impl App {
         dirs
     }
 
-    /// Delete every marked directory, either to the OS trash or permanently.
-    /// Successfully removed rows are dropped from the table (and the eventual
-    /// summary); failures are surfaced as warnings, and a one-line result is
-    /// left in the footer.
-    fn perform_deletion(&mut self, permanent: bool) {
+    /// Begin deleting every marked directory, either to the OS trash or
+    /// permanently. The removal runs on a worker thread — moving a large tree to
+    /// the trash (especially across volumes, where it becomes a recursive copy)
+    /// can take a while, and doing it inline would freeze the UI — while
+    /// `drain_deletion` applies the streamed results each tick.
+    fn start_deletion(&mut self, permanent: bool) {
         let targets = self.selected_dirs();
-        let mut deleted: Vec<PathBuf> = Vec::new();
-        let mut reclaimed: u64 = 0;
-        let mut failures = 0usize;
+        if targets.is_empty() {
+            return;
+        }
+        self.action = None;
+        self.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total: targets.len(),
+            reclaimed: 0,
+            failures: 0,
+            permanent,
+        });
 
-        for (path, size) in &targets {
-            match delete_path(path, permanent) {
-                Ok(()) => {
-                    deleted.push(path.clone());
-                    reclaimed += size;
+        let (tx, rx) = mpsc::channel();
+        self.delete_rx = Some(rx);
+        thread::spawn(move || {
+            for (path, size) in targets {
+                let outcome = match delete_path(&path, permanent) {
+                    Ok(()) => DeleteOutcome::Removed { path, size },
+                    Err(error) => DeleteOutcome::Failed { path, error },
+                };
+                // The UI hung up (quit): stop early, nothing left to report to.
+                if tx.send(outcome).is_err() {
+                    break;
                 }
-                Err(e) => {
-                    failures += 1;
+            }
+        });
+    }
+
+    /// Apply any deletion outcomes that have arrived from the worker thread,
+    /// pruning removed rows live and finishing up once the channel closes.
+    fn drain_deletion(&mut self) {
+        loop {
+            let Some(rx) = &self.delete_rx else {
+                return;
+            };
+            match rx.try_recv() {
+                Ok(DeleteOutcome::Removed { path, size }) => {
+                    self.remove_rows(&[path.clone()]);
+                    self.selected.remove(&path);
+                    if let Some(p) = &mut self.delete_progress {
+                        p.done += 1;
+                        p.reclaimed += size;
+                    }
+                }
+                Ok(DeleteOutcome::Failed { path, error }) => {
                     self.warnings += 1;
-                    self.last_warning = Some(format!("failed to delete {}: {e}", path.display()));
+                    self.last_warning =
+                        Some(format!("failed to delete {}: {error}", path.display()));
+                    self.selected.remove(&path);
+                    if let Some(p) = &mut self.delete_progress {
+                        p.done += 1;
+                        p.failures += 1;
+                    }
+                }
+                Err(TryRecvError::Empty) => return,
+                Err(TryRecvError::Disconnected) => {
+                    self.finish_deletion();
+                    return;
                 }
             }
         }
+    }
 
-        self.remove_rows(&deleted);
-        for p in &deleted {
-            self.selected.remove(p);
-        }
-
-        let verb = if permanent { "Deleted" } else { "Trashed" };
-        let ok = deleted.len();
-        self.action = Some(if failures == 0 {
+    /// Tear down the in-flight deletion state and leave a one-line summary in the
+    /// footer.
+    fn finish_deletion(&mut self) {
+        self.delete_rx = None;
+        let Some(p) = self.delete_progress.take() else {
+            return;
+        };
+        let verb = if p.permanent { "Deleted" } else { "Trashed" };
+        let ok = p.done - p.failures;
+        self.action = Some(if p.failures == 0 {
             format!(
                 "{verb} {ok} director{} · reclaimed {}",
                 if ok == 1 { "y" } else { "ies" },
-                human_size(reclaimed)
+                human_size(p.reclaimed)
             )
         } else {
             format!(
-                "{verb} {ok}, {failures} failed · reclaimed {} · see ⚠",
-                human_size(reclaimed)
+                "{verb} {ok}, {} failed · reclaimed {} · see ⚠",
+                p.failures,
+                human_size(p.reclaimed)
             )
         });
     }
@@ -744,12 +823,70 @@ impl App {
         self.draw_table(frame, chunks[1]);
         self.draw_footer(frame, chunks[2]);
 
+        // An in-flight deletion takes over the screen, superseding any overlay.
+        if self.delete_progress.is_some() {
+            self.draw_deleting(frame);
+            return;
+        }
+
         match self.overlay {
             Overlay::Help => self.draw_help(frame),
             Overlay::Ecosystems { cursor } => self.draw_eco_panel(frame, cursor),
             Overlay::ConfirmDelete { permanent } => self.draw_confirm_delete(frame, permanent),
             Overlay::None => {}
         }
+    }
+
+    /// A spinner-and-progress modal shown while the worker thread removes the
+    /// marked directories, so a slow trash operation reads as "working", not
+    /// "frozen".
+    fn draw_deleting(&self, frame: &mut Frame) {
+        let Some(p) = &self.delete_progress else {
+            return;
+        };
+        let verb = if p.permanent {
+            "Deleting"
+        } else {
+            "Moving to trash"
+        };
+        let lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", SPINNER[self.spinner]),
+                    Style::new().fg(Color::Yellow).bold(),
+                ),
+                Span::styled(
+                    format!("{verb} {} of {}…", (p.done + 1).min(p.total), p.total),
+                    Style::new().fg(Color::White).bold(),
+                ),
+            ]),
+            Line::raw(""),
+            Line::from(vec![
+                Span::styled("Reclaimed so far: ", Style::new().fg(Color::Gray)),
+                Span::styled(
+                    human_size(p.reclaimed),
+                    Style::new().fg(Color::Green).bold(),
+                ),
+            ]),
+            Line::raw(""),
+            Line::from(Span::styled(
+                "Please wait — Ctrl-C to abort.",
+                Style::new().fg(Color::DarkGray).italic(),
+            )),
+        ];
+        let area = centered_rect(frame.area(), 50, lines.len() as u16 + 2);
+        frame.render_widget(Clear, area);
+        let para = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Yellow))
+                .title(Span::styled(
+                    " Working ",
+                    Style::new().fg(Color::Yellow).bold(),
+                ))
+                .style(Style::new().bg(Color::Rgb(24, 22, 16))),
+        );
+        frame.render_widget(para, area);
     }
 
     fn draw_header(&self, frame: &mut Frame, area: Rect) {
@@ -1575,9 +1712,18 @@ mod tests {
         }));
         app.selected.insert(victim.clone());
 
-        app.perform_deletion(true);
+        // Deletion runs on a worker thread; pump the drain until it finishes.
+        app.start_deletion(true);
+        for _ in 0..1000 {
+            app.drain_deletion();
+            if app.delete_progress.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         // The directory is gone, the row is pruned and the selection is empty.
+        assert!(app.delete_progress.is_none(), "deletion did not finish");
         assert!(!victim.exists());
         assert!(app.rows.is_empty());
         assert!(app.selected.is_empty());
