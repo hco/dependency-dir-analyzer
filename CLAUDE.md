@@ -47,6 +47,7 @@ src/
   scanner.rs    # filesystem walk, patterns, parallel sizing, batch + streaming APIs
   report.rs     # Report struct + table/JSON/CSV rendering, size & age formatting
   tui.rs        # interactive live-updating ratatui UI (consumes the streaming scan)
+  state.rs      # persisted TUI view prefs (sort/group/filters), keyed by scan root
 .github/workflows/
   ci.yml        # lint/test/build on Linux, macOS, Windows via mise
   release.yml   # cross-compiled release binaries on tag push

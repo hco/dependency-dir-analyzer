@@ -1,6 +1,7 @@
 mod cli;
 mod report;
 mod scanner;
+mod state;
 mod tui;
 
 use std::io::{self, IsTerminal};

@@ -23,6 +23,7 @@ use ratatui::DefaultTerminal;
 
 use crate::report::{human_size, relative_age};
 use crate::scanner::{self, DependencyDir, ScanEvent, ScanOptions};
+use crate::state::{self, AgeFilter, SizeFilter, SortKey, ViewState};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(100);
@@ -42,14 +43,22 @@ pub fn run(
         scanner::scan_streaming(&root_buf, &opts, tx);
     });
 
+    // Restore the view preferences last used for this directory.
+    let view = state::load(root);
+
     let mut terminal = ratatui::init();
-    let mut app = App::new(root.to_path_buf(), top, min_size);
+    let mut app = App::new(root.to_path_buf(), top, min_size, view);
     let result = app.event_loop(&mut terminal, rx);
     ratatui::restore();
 
     // The scan thread finishes once its `tx` is dropped at the end of
     // `scan_streaming`; joining keeps us from leaking it.
     let _ = scan_thread.join();
+
+    // Remember the current view for next time (best-effort; only on clean exit).
+    if result.is_ok() {
+        state::save(root, &app.view_state());
+    }
 
     result.map(|()| app.final_results())
 }
@@ -75,124 +84,6 @@ impl Row {
         match self {
             Row::Pending { ecosystem, .. } => ecosystem,
             Row::Done(d) => d.ecosystem,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    Size,
-    Modified,
-    Name,
-    Files,
-}
-
-impl SortKey {
-    fn next(self) -> Self {
-        match self {
-            SortKey::Size => SortKey::Modified,
-            SortKey::Modified => SortKey::Name,
-            SortKey::Name => SortKey::Files,
-            SortKey::Files => SortKey::Size,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            SortKey::Size => "size",
-            SortKey::Modified => "modified",
-            SortKey::Name => "name",
-            SortKey::Files => "files",
-        }
-    }
-}
-
-/// Minimum-size threshold cycler applied on top of the CLI `--min-size`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SizeFilter {
-    All,
-    Mb1,
-    Mb10,
-    Mb100,
-    Gb1,
-}
-
-impl SizeFilter {
-    fn next(self) -> Self {
-        match self {
-            SizeFilter::All => SizeFilter::Mb1,
-            SizeFilter::Mb1 => SizeFilter::Mb10,
-            SizeFilter::Mb10 => SizeFilter::Mb100,
-            SizeFilter::Mb100 => SizeFilter::Gb1,
-            SizeFilter::Gb1 => SizeFilter::All,
-        }
-    }
-
-    fn min_bytes(self) -> u64 {
-        match self {
-            SizeFilter::All => 0,
-            SizeFilter::Mb1 => 1_000_000,
-            SizeFilter::Mb10 => 10_000_000,
-            SizeFilter::Mb100 => 100_000_000,
-            SizeFilter::Gb1 => 1_000_000_000,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            SizeFilter::All => "all",
-            SizeFilter::Mb1 => "≥1 MB",
-            SizeFilter::Mb10 => "≥10 MB",
-            SizeFilter::Mb100 => "≥100 MB",
-            SizeFilter::Gb1 => "≥1 GB",
-        }
-    }
-}
-
-/// "Modified older than" threshold cycler.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgeFilter {
-    Any,
-    Day1,
-    Week1,
-    Month1,
-    Month6,
-    Year1,
-}
-
-impl AgeFilter {
-    fn next(self) -> Self {
-        match self {
-            AgeFilter::Any => AgeFilter::Day1,
-            AgeFilter::Day1 => AgeFilter::Week1,
-            AgeFilter::Week1 => AgeFilter::Month1,
-            AgeFilter::Month1 => AgeFilter::Month6,
-            AgeFilter::Month6 => AgeFilter::Year1,
-            AgeFilter::Year1 => AgeFilter::Any,
-        }
-    }
-
-    /// Minimum age in seconds a directory must have to pass, or `None` for "any".
-    fn min_age_secs(self) -> Option<u64> {
-        const DAY: u64 = 86_400;
-        match self {
-            AgeFilter::Any => None,
-            AgeFilter::Day1 => Some(DAY),
-            AgeFilter::Week1 => Some(7 * DAY),
-            AgeFilter::Month1 => Some(30 * DAY),
-            AgeFilter::Month6 => Some(182 * DAY),
-            AgeFilter::Year1 => Some(365 * DAY),
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            AgeFilter::Any => "any",
-            AgeFilter::Day1 => ">1d",
-            AgeFilter::Week1 => ">1w",
-            AgeFilter::Month1 => ">1mo",
-            AgeFilter::Month6 => ">6mo",
-            AgeFilter::Year1 => ">1y",
         }
     }
 }
@@ -227,11 +118,11 @@ struct App {
     size_filter: SizeFilter,
     age_filter: AgeFilter,
     /// Ecosystems the user has toggled *off* in the ecosystem panel. Empty means
-    /// every ecosystem is shown.
-    disabled_ecos: HashSet<&'static str>,
+    /// every ecosystem is shown. Stored by label so it survives across restarts.
+    disabled_ecos: HashSet<String>,
     /// Ecosystems whose group is collapsed (header shown, rows hidden). Only has
     /// an effect while grouping is on.
-    collapsed_ecos: HashSet<&'static str>,
+    collapsed_ecos: HashSet<String>,
     overlay: Overlay,
     spinner: usize,
     top: usize,
@@ -240,24 +131,36 @@ struct App {
 }
 
 impl App {
-    fn new(root: PathBuf, top: usize, min_size: u64) -> Self {
+    fn new(root: PathBuf, top: usize, min_size: u64, view: ViewState) -> Self {
         App {
             root,
             rows: Vec::new(),
             warnings: 0,
             last_warning: None,
             scanning: true,
-            sort: SortKey::Size,
-            group: false,
-            size_filter: SizeFilter::All,
-            age_filter: AgeFilter::Any,
-            disabled_ecos: HashSet::new(),
-            collapsed_ecos: HashSet::new(),
+            sort: view.sort,
+            group: view.group,
+            size_filter: view.size_filter,
+            age_filter: view.age_filter,
+            disabled_ecos: view.disabled_ecos,
+            collapsed_ecos: view.collapsed_ecos,
             overlay: Overlay::None,
             spinner: 0,
             top,
             min_size,
             state: TableState::default(),
+        }
+    }
+
+    /// Snapshot the current view preferences for persistence.
+    fn view_state(&self) -> ViewState {
+        ViewState {
+            sort: self.sort,
+            group: self.group,
+            size_filter: self.size_filter,
+            age_filter: self.age_filter,
+            disabled_ecos: self.disabled_ecos.clone(),
+            collapsed_ecos: self.collapsed_ecos.clone(),
         }
     }
 
@@ -386,7 +289,7 @@ impl App {
             KeyCode::Char(' ') | KeyCode::Enter => {
                 if let Some(&eco) = ecos.get(*cursor) {
                     if !self.disabled_ecos.remove(eco) {
-                        self.disabled_ecos.insert(eco);
+                        self.disabled_ecos.insert(eco.to_string());
                     }
                 }
             }
@@ -394,7 +297,8 @@ impl App {
                 // Toggle all: if anything is disabled, enable everything;
                 // otherwise disable everything.
                 if self.disabled_ecos.is_empty() {
-                    self.disabled_ecos.extend(ecos.iter().copied());
+                    self.disabled_ecos
+                        .extend(ecos.iter().map(|e| e.to_string()));
                 } else {
                     self.disabled_ecos.clear();
                 }
@@ -443,7 +347,7 @@ impl App {
             _ => return,
         };
         if !self.collapsed_ecos.remove(eco) {
-            self.collapsed_ecos.insert(eco);
+            self.collapsed_ecos.insert(eco.to_string());
         }
     }
 
@@ -485,7 +389,7 @@ impl App {
             self.rows
                 .iter()
                 .filter(|r| {
-                    matches!(r, Row::Pending { ecosystem, .. } if !self.disabled_ecos.contains(ecosystem))
+                    matches!(r, Row::Pending { .. }) && !self.disabled_ecos.contains(r.ecosystem())
                 })
                 .collect()
         } else {
@@ -944,7 +848,7 @@ impl App {
             ecos.iter()
                 .enumerate()
                 .map(|(i, eco)| {
-                    let enabled = !self.disabled_ecos.contains(eco);
+                    let enabled = !self.disabled_ecos.contains(*eco);
                     let marker = if i == cursor { "▶ " } else { "  " };
                     let check = if enabled { "[x]" } else { "[ ]" };
                     let row_style = if i == cursor {
@@ -1130,29 +1034,9 @@ mod tests {
     }
 
     #[test]
-    fn sort_key_cycles() {
-        let mut k = SortKey::Size;
-        k = k.next();
-        assert_eq!(k, SortKey::Modified);
-        k = k.next().next().next();
-        assert_eq!(k, SortKey::Size);
-    }
-
-    #[test]
-    fn size_filter_cycles_and_thresholds_increase() {
-        let mut f = SizeFilter::All;
-        assert_eq!(f.min_bytes(), 0);
-        f = f.next();
-        assert_eq!(f, SizeFilter::Mb1);
-        // Cycling all the way around returns to All.
-        let back = f.next().next().next().next();
-        assert_eq!(back, SizeFilter::All);
-    }
-
-    #[test]
     fn age_filter_older_than_semantics() {
         let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
-        let mut app = App::new(PathBuf::from("/tmp"), 0, 0);
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
         app.age_filter = AgeFilter::Month1;
         // Modified 60 days ago passes ">1mo"; 1 day ago does not.
         let old = Some(now - Duration::from_secs(60 * 86_400));
@@ -1179,7 +1063,7 @@ mod tests {
 
     #[test]
     fn collapsing_a_group_hides_only_its_rows() {
-        let mut app = App::new(PathBuf::from("/tmp"), 0, 0);
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
         app.scanning = false;
         app.group = true;
         app.rows.push(done_row("Node.js", "node_modules", 100));
@@ -1202,7 +1086,7 @@ mod tests {
         assert_eq!(count(&app), (2, 2));
 
         // Collapsing one group keeps both headers but hides that group's row.
-        app.collapsed_ecos.insert("Rust / Maven");
+        app.collapsed_ecos.insert("Rust / Maven".to_string());
         assert_eq!(count(&app), (2, 1));
 
         // Reset restores everything.
