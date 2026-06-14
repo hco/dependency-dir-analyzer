@@ -14,7 +14,12 @@ The binary is called **`dda`**.
 ## Features
 
 - **Interactive, live-updating TUI** — results stream in and re-sort as the
-  scan runs; you don't wait for it to finish. Scroll, re-sort, and quit.
+  scan runs; you don't wait for it to finish. Scroll, re-sort, group by
+  ecosystem, and filter by size or age.
+- **Reclaim space safely** — mark the directories you want gone (one at a time,
+  a whole ecosystem, or everything visible), watch the total to-be-freed size
+  add up, then delete them after a confirmation step. Deletions move to the
+  system trash by default (recoverable), with an opt-in permanent mode.
 - **Size _and_ last-modified time** — stale directories (good cleanup
   candidates) are colour-coded by age, so you can tell a six-month-old
   `node_modules` from one you built this morning.
@@ -38,8 +43,9 @@ On a terminal, `dda` opens an interactive view that fills in as it scans:
 │ 180 MB     █          640    1y ago    Python (venv).venv                   │
 │ ⠹ sizing…             —      —         Go / PHP …   api/vendor              │
 ├────────────────────────────────────────────────────────────────────────────┤
-│ 1.84 GB   3 shown · 3 sized · 4 found   sort: size                          │
-│ ↑/↓ move   s sort   g/G top/bottom   q quit                                 │
+│ 1.84 GB    ✗ 2 marked · 1.62 GB    3 shown · 3 sized · 4 found   sort: size  │
+│ ↑/↓ move   s sort   g group   ↵ fold   f size   a age   e ecosystem   r reset│
+│ space/x mark   A all   c clear   d delete   ? help   q quit                  │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,13 +88,29 @@ are always non-interactive.
 
 ### TUI keys
 
-| Key            | Action                                   |
-| -------------- | ---------------------------------------- |
-| `↑` / `↓`, `j` / `k` | Move the selection                  |
-| `PgUp` / `PgDn`      | Jump a page                         |
-| `g` / `G`            | Jump to the top / bottom            |
+| Key                  | Action                                      |
+| -------------------- | ------------------------------------------- |
+| `↑` / `↓`, `j` / `k` | Move the cursor                             |
+| `PgUp` / `PgDn`      | Jump a page                                 |
+| `Home` / `End`       | Jump to the first / last row                |
 | `s`                  | Cycle sort (size → modified → name → files) |
-| `q` / `Esc`          | Quit                                |
+| `g`                  | Toggle grouping by ecosystem                |
+| `Enter`              | Fold / unfold the selected group            |
+| `f`                  | Cycle the minimum-size filter               |
+| `a`                  | Cycle the "modified older than" filter      |
+| `e`                  | Open the ecosystem filter (multi-select)    |
+| `r`                  | Reset all filters and grouping              |
+| `Space` / `x`        | Mark / unmark for deletion (a whole group on a header) |
+| `A`                  | Mark / unmark all visible directories       |
+| `c`                  | Clear the selection                         |
+| `d` / `Del`          | Delete marked directories (asks to confirm) |
+| `?`                  | Toggle the keyboard-shortcuts help          |
+| `q` / `Esc`          | Quit                                        |
+
+When you press `d`, a confirmation dialog lists what will be removed and the
+space it frees. Deletions go to the **system trash** by default (recoverable);
+press `t` in the dialog to switch to an irreversible **permanent delete**, then
+`y` to confirm or `Esc` to cancel.
 
 Examples:
 

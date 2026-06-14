@@ -4,8 +4,9 @@
 //! channel; the UI thread drains them every tick, so dependency directories
 //! appear as soon as they are discovered and their sizes fill in as the
 //! parallel sizing completes. The user can scroll, re-sort, group by ecosystem,
-//! filter, and quit; on exit the final largest-first results are returned so the
-//! caller can leave a static summary in the terminal scrollback.
+//! filter, mark directories for deletion, and quit; on exit the final
+//! largest-first results (minus anything deleted) are returned so the caller can
+//! leave a static summary in the terminal scrollback.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,10 @@ use crate::state::{self, AgeFilter, SizeFilter, SortKey, ViewState};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const TICK: Duration = Duration::from_millis(100);
+
+/// Foreground/background accents for directories marked for deletion.
+const SELECT_FG: Color = Color::Rgb(255, 120, 120);
+const SELECT_BG: Color = Color::Rgb(60, 28, 34);
 
 /// Run the interactive TUI for a scan of `root`, returning the final list of
 /// dependency directories (sorted largest-first and filtered by `min_size` /
@@ -92,7 +97,15 @@ impl Row {
 enum Overlay {
     None,
     Help,
-    Ecosystems { cursor: usize },
+    Ecosystems {
+        cursor: usize,
+    },
+    /// Confirmation gate before deleting the marked directories. `permanent`
+    /// toggles between moving to the OS trash (default) and an irreversible
+    /// `remove_dir_all`.
+    ConfirmDelete {
+        permanent: bool,
+    },
 }
 
 /// One rendered line of the table: an ecosystem group header (only when
@@ -102,6 +115,8 @@ enum DisplayItem<'a> {
         ecosystem: &'static str,
         total: u64,
         count: usize,
+        /// How many of the group's directories are marked for deletion.
+        selected: usize,
         collapsed: bool,
     },
     Data(&'a Row),
@@ -123,6 +138,12 @@ struct App {
     /// Ecosystems whose group is collapsed (header shown, rows hidden). Only has
     /// an effect while grouping is on.
     collapsed_ecos: HashSet<String>,
+    /// Directories marked for deletion, keyed by path. In-memory only — a
+    /// deletion set is deliberately never persisted across runs.
+    selected: HashSet<PathBuf>,
+    /// Transient one-line status shown in the footer after an action (e.g. the
+    /// result of a deletion). Cleared the next time the selection changes.
+    action: Option<String>,
     overlay: Overlay,
     spinner: usize,
     top: usize,
@@ -144,6 +165,8 @@ impl App {
             age_filter: view.age_filter,
             disabled_ecos: view.disabled_ecos,
             collapsed_ecos: view.collapsed_ecos,
+            selected: HashSet::new(),
+            action: None,
             overlay: Overlay::None,
             spinner: 0,
             top,
@@ -238,6 +261,10 @@ impl App {
                 self.handle_eco_key(code);
                 false
             }
+            Overlay::ConfirmDelete { .. } => {
+                self.handle_confirm_key(code);
+                false
+            }
             Overlay::None => self.handle_main_key(code),
         }
     }
@@ -256,7 +283,14 @@ impl App {
                     self.move_selection(len as isize);
                 }
             }
-            KeyCode::Enter | KeyCode::Char(' ') => self.toggle_collapse(),
+            // Enter folds the selected group; Space/x marks for deletion. Both
+            // used to fold, but selection needs a binding and a checkbox-style
+            // Space is the more intuitive of the two.
+            KeyCode::Enter => self.toggle_collapse(),
+            KeyCode::Char(' ') | KeyCode::Char('x') => self.toggle_selection(),
+            KeyCode::Char('A') => self.toggle_select_all_visible(),
+            KeyCode::Char('c') => self.clear_selection(),
+            KeyCode::Char('d') | KeyCode::Delete => self.open_confirm_delete(),
             KeyCode::Char('s') => self.sort = self.sort.next(),
             KeyCode::Char('g') => self.group = !self.group,
             KeyCode::Char('f') => self.size_filter = self.size_filter.next(),
@@ -267,6 +301,28 @@ impl App {
             _ => {}
         }
         false
+    }
+
+    fn handle_confirm_key(&mut self, code: KeyCode) {
+        let permanent = match self.overlay {
+            Overlay::ConfirmDelete { permanent } => permanent,
+            _ => return,
+        };
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                self.perform_deletion(permanent);
+                self.overlay = Overlay::None;
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
+            }
+            KeyCode::Char('t') | KeyCode::Char('T') => {
+                self.overlay = Overlay::ConfirmDelete {
+                    permanent: !permanent,
+                };
+            }
+            _ => {}
+        }
     }
 
     fn handle_eco_key(&mut self, code: KeyCode) {
@@ -349,6 +405,177 @@ impl App {
         if !self.collapsed_ecos.remove(eco) {
             self.collapsed_ecos.insert(eco.to_string());
         }
+    }
+
+    /// Mark or unmark the highlighted item for deletion. On a data row this
+    /// toggles that single directory; on a group header it toggles every
+    /// (currently visible) directory in the ecosystem at once. Pending rows,
+    /// whose size isn't known yet, can't be selected.
+    fn toggle_selection(&mut self) {
+        self.action = None;
+        let Some(sel) = self.state.selected() else {
+            return;
+        };
+        // Resolve the selection to an owned target first so the immutable borrow
+        // from `display_items` is released before we mutate `self.selected`.
+        enum Target {
+            Row(PathBuf),
+            Group(&'static str),
+        }
+        let target = match self.display_items(now()).get(sel) {
+            Some(DisplayItem::Data(Row::Done(d))) => Some(Target::Row(d.path.clone())),
+            Some(DisplayItem::Header { ecosystem, .. }) => Some(Target::Group(ecosystem)),
+            _ => None,
+        };
+        match target {
+            Some(Target::Row(path)) => {
+                if !self.selected.remove(&path) {
+                    self.selected.insert(path);
+                }
+            }
+            Some(Target::Group(eco)) => self.toggle_group_selection(eco),
+            None => {}
+        }
+    }
+
+    /// Toggle selection for every visible directory in `eco`: if they are all
+    /// already marked, clear them; otherwise mark them all.
+    fn toggle_group_selection(&mut self, eco: &str) {
+        let now = now();
+        let paths: Vec<PathBuf> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Done(d) if d.ecosystem == eco && self.passes(d, now) => Some(d.path.clone()),
+                _ => None,
+            })
+            .collect();
+        let all_marked = !paths.is_empty() && paths.iter().all(|p| self.selected.contains(p));
+        if all_marked {
+            for p in &paths {
+                self.selected.remove(p);
+            }
+        } else {
+            self.selected.extend(paths);
+        }
+    }
+
+    /// Toggle selection for every directory currently shown (respecting active
+    /// filters and the `--top` cap): mark them all, or clear them if they were.
+    fn toggle_select_all_visible(&mut self) {
+        self.action = None;
+        let paths: Vec<PathBuf> = self
+            .display_items(now())
+            .iter()
+            .filter_map(|it| match it {
+                DisplayItem::Data(Row::Done(d)) => Some(d.path.clone()),
+                _ => None,
+            })
+            .collect();
+        let all_marked = !paths.is_empty() && paths.iter().all(|p| self.selected.contains(p));
+        if all_marked {
+            for p in &paths {
+                self.selected.remove(p);
+            }
+        } else {
+            self.selected.extend(paths);
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selected.clear();
+        self.action = None;
+    }
+
+    /// Open the delete-confirmation overlay, defaulting to the recoverable
+    /// move-to-trash mode. A no-op (with a nudge) when nothing is marked.
+    fn open_confirm_delete(&mut self) {
+        if self.selected_total().0 == 0 {
+            self.action = Some("Nothing marked — press space to mark directories.".to_string());
+            return;
+        }
+        self.overlay = Overlay::ConfirmDelete { permanent: false };
+    }
+
+    /// Count and total size of the directories currently marked for deletion.
+    fn selected_total(&self) -> (usize, u64) {
+        self.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Done(d) if self.selected.contains(&d.path) => Some(d.size_bytes),
+                _ => None,
+            })
+            .fold((0, 0), |(n, bytes), size| (n + 1, bytes + size))
+    }
+
+    /// The marked directories as `(path, size)` pairs, largest first — used to
+    /// render the confirmation list.
+    fn selected_dirs(&self) -> Vec<(PathBuf, u64)> {
+        let mut dirs: Vec<(PathBuf, u64)> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Done(d) if self.selected.contains(&d.path) => {
+                    Some((d.path.clone(), d.size_bytes))
+                }
+                _ => None,
+            })
+            .collect();
+        dirs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        dirs
+    }
+
+    /// Delete every marked directory, either to the OS trash or permanently.
+    /// Successfully removed rows are dropped from the table (and the eventual
+    /// summary); failures are surfaced as warnings, and a one-line result is
+    /// left in the footer.
+    fn perform_deletion(&mut self, permanent: bool) {
+        let targets = self.selected_dirs();
+        let mut deleted: Vec<PathBuf> = Vec::new();
+        let mut reclaimed: u64 = 0;
+        let mut failures = 0usize;
+
+        for (path, size) in &targets {
+            match delete_path(path, permanent) {
+                Ok(()) => {
+                    deleted.push(path.clone());
+                    reclaimed += size;
+                }
+                Err(e) => {
+                    failures += 1;
+                    self.warnings += 1;
+                    self.last_warning = Some(format!("failed to delete {}: {e}", path.display()));
+                }
+            }
+        }
+
+        self.remove_rows(&deleted);
+        for p in &deleted {
+            self.selected.remove(p);
+        }
+
+        let verb = if permanent { "Deleted" } else { "Trashed" };
+        let ok = deleted.len();
+        self.action = Some(if failures == 0 {
+            format!(
+                "{verb} {ok} director{} · reclaimed {}",
+                if ok == 1 { "y" } else { "ies" },
+                human_size(reclaimed)
+            )
+        } else {
+            format!(
+                "{verb} {ok}, {failures} failed · reclaimed {} · see ⚠",
+                human_size(reclaimed)
+            )
+        });
+    }
+
+    /// Drop the given paths from the row list (after they were deleted on disk).
+    fn remove_rows(&mut self, paths: &[PathBuf]) {
+        if paths.is_empty() {
+            return;
+        }
+        self.rows.retain(|r| !paths.iter().any(|p| p == r.path()));
     }
 
     /// Whether a completed directory passes the active filters.
@@ -436,11 +663,16 @@ impl App {
         for (eco, rows) in ordered {
             let total = group_total(&rows);
             let count = rows.iter().filter(|r| matches!(r, Row::Done(_))).count();
+            let selected = rows
+                .iter()
+                .filter(|r| matches!(r, Row::Done(d) if self.selected.contains(&d.path)))
+                .count();
             let collapsed = self.collapsed_ecos.contains(eco);
             items.push(DisplayItem::Header {
                 ecosystem: eco,
                 total,
                 count,
+                selected,
                 collapsed,
             });
             if !collapsed {
@@ -504,7 +736,7 @@ impl App {
         let chunks = Layout::vertical([
             Constraint::Length(3),
             Constraint::Min(1),
-            Constraint::Length(4),
+            Constraint::Length(5),
         ])
         .split(frame.area());
 
@@ -515,6 +747,7 @@ impl App {
         match self.overlay {
             Overlay::Help => self.draw_help(frame),
             Overlay::Ecosystems { cursor } => self.draw_eco_panel(frame, cursor),
+            Overlay::ConfirmDelete { permanent } => self.draw_confirm_delete(frame, permanent),
             Overlay::None => {}
         }
     }
@@ -604,8 +837,9 @@ impl App {
             .max()
             .unwrap_or(0);
 
-        // Bar column width derives from the available area.
-        let bar_width = (area.width as usize).saturating_sub(64).clamp(6, 24);
+        // Bar column width derives from the available area (the leading
+        // checkbox column and its spacing take a few more cells than before).
+        let bar_width = (area.width as usize).saturating_sub(67).clamp(6, 24);
 
         // Collect into an owned Vec so the immutable borrow of `self`/`items`
         // ends before the table is rendered with `&mut self.state` below.
@@ -615,6 +849,7 @@ impl App {
             .collect();
 
         let header = TableRow::new(vec![
+            Cell::from(""),
             Cell::from("Size"),
             Cell::from(""),
             Cell::from("Files"),
@@ -625,6 +860,7 @@ impl App {
         .style(Style::new().fg(Color::Black).bg(Color::Cyan).bold());
 
         let widths = [
+            Constraint::Length(1),
             Constraint::Length(10),
             Constraint::Length(bar_width as u16),
             Constraint::Length(8),
@@ -658,10 +894,21 @@ impl App {
                 ecosystem,
                 total,
                 count,
+                selected,
                 collapsed,
             } => {
                 let glyph = if *collapsed { "▸" } else { "▾" };
+                // Header checkbox reflects the group: full when every directory
+                // is marked, partial (◐) when only some are.
+                let (mark, mark_style) = if *count > 0 && *selected == *count {
+                    ("✓", Style::new().fg(SELECT_FG).bold())
+                } else if *selected > 0 {
+                    ("◐", Style::new().fg(SELECT_FG).bold())
+                } else {
+                    (" ", Style::new())
+                };
                 TableRow::new(vec![
+                    Cell::from(mark).style(mark_style),
                     Cell::from(human_size(*total)).style(Style::new().fg(Color::White).bold()),
                     Cell::from(""),
                     Cell::from(format!("{count} dir{}", if *count == 1 { "" } else { "s" }))
@@ -681,7 +928,10 @@ impl App {
                 };
                 let color = size_color(frac);
                 let indent = if self.group { "  " } else { "" };
-                TableRow::new(vec![
+                let marked = self.selected.contains(&d.path);
+                let mark = if marked { "✓" } else { " " };
+                let row = TableRow::new(vec![
+                    Cell::from(mark).style(Style::new().fg(SELECT_FG).bold()),
                     Cell::from(human_size(d.size_bytes)).style(Style::new().fg(color).bold()),
                     Cell::from(build_bar(frac, bar_width)).style(Style::new().fg(color)),
                     Cell::from(d.file_count.to_string()).style(Style::new().fg(Color::Gray)),
@@ -689,9 +939,17 @@ impl App {
                         .style(Style::new().fg(age_color(d.modified))),
                     Cell::from(d.ecosystem).style(Style::new().fg(Color::Cyan)),
                     Cell::from(format!("{indent}{}", self.display_path(&d.path))),
-                ])
+                ]);
+                // Tint marked rows so the deletion set stands out even when the
+                // cursor is elsewhere.
+                if marked {
+                    row.style(Style::new().bg(SELECT_BG))
+                } else {
+                    row
+                }
             }
             DisplayItem::Data(Row::Pending { path, ecosystem }) => TableRow::new(vec![
+                Cell::from(" "),
                 Cell::from(format!("{} sizing…", SPINNER[self.spinner]))
                     .style(Style::new().fg(Color::DarkGray)),
                 Cell::from(build_bar(0.0, bar_width)),
@@ -732,11 +990,21 @@ impl App {
             })
             .sum();
 
-        let mut chips = vec![
-            Span::styled(
-                format!(" {} ", human_size(total)),
-                Style::new().bg(Color::Green).fg(Color::Black).bold(),
-            ),
+        // The deletion set gets its own prominent, attention-grabbing chip right
+        // after the reclaimable-space total.
+        let (sel_count, sel_bytes) = self.selected_total();
+        let mut chips = vec![Span::styled(
+            format!(" {} ", human_size(total)),
+            Style::new().bg(Color::Green).fg(Color::Black).bold(),
+        )];
+        if sel_count > 0 {
+            chips.push(Span::raw(" "));
+            chips.push(Span::styled(
+                format!(" ✗ {sel_count} marked · {} ", human_size(sel_bytes)),
+                Style::new().bg(Color::Red).fg(Color::White).bold(),
+            ));
+        }
+        chips.extend([
             Span::raw("  "),
             Span::styled(
                 format!("{shown} shown · {sized} sized · {} found", self.rows.len()),
@@ -756,7 +1024,7 @@ impl App {
                     Color::DarkGray
                 }),
             ),
-        ];
+        ]);
         chips.push(Span::raw("  "));
         chips.push(filter_chip(
             "size",
@@ -783,13 +1051,38 @@ impl App {
                 Style::new().fg(Color::Yellow),
             ));
         }
+        // The transient result of the last action (e.g. a deletion) trails the
+        // chips until the selection changes again.
+        if let Some(msg) = &self.action {
+            chips.push(Span::raw("   "));
+            chips.push(Span::styled(
+                msg.clone(),
+                Style::new().fg(Color::Green).italic(),
+            ));
+        }
 
-        let hints = Line::from(vec![Span::styled(
-            "↑/↓ move   s sort   g group   ↵ fold   f size   a age   e ecosystem   r reset   ? help   q quit",
+        // Two hint rows: view controls on top, the selection/deletion verbs
+        // (which the footer chip already advertises with "press d to delete")
+        // below.
+        let hints_view = Line::from(vec![Span::styled(
+            "↑/↓ move   s sort   g group   ↵ fold   f size   a age   e ecosystem   r reset",
             Style::new().fg(Color::DarkGray),
         )]);
+        let delete_hint = if sel_count > 0 {
+            Span::styled("d delete", Style::new().fg(SELECT_FG).bold())
+        } else {
+            Span::styled("d delete", Style::new().fg(Color::DarkGray))
+        };
+        let hints_action = Line::from(vec![
+            Span::styled(
+                "space/x mark   A all   c clear   ",
+                Style::new().fg(Color::DarkGray),
+            ),
+            delete_hint,
+            Span::styled("   ? help   q quit", Style::new().fg(Color::DarkGray)),
+        ]);
 
-        let text = Text::from(vec![Line::from(chips), hints]);
+        let text = Text::from(vec![Line::from(chips), hints_view, hints_action]);
         let para = Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -811,6 +1104,11 @@ impl App {
             help_line("a", "cycle \"modified older than\" filter"),
             help_line("e", "open ecosystem filter (multi-select)"),
             help_line("r", "reset all filters & grouping"),
+            Line::raw(""),
+            help_line("Space / x", "mark/unmark for deletion (group on a header)"),
+            help_line("A", "mark/unmark all visible"),
+            help_line("c", "clear the selection"),
+            help_line("d / Del", "delete marked dirs (asks to confirm)"),
             Line::raw(""),
             help_line("?", "toggle this help"),
             help_line("q / Esc", "quit"),
@@ -902,6 +1200,109 @@ impl App {
         frame.render_widget(para, area);
     }
 
+    /// The deletion confirmation modal: lists the marked directories, the total
+    /// space to be reclaimed, the current mode (trash vs permanent) and the
+    /// keys. The accent colour and wording shift to red when the irreversible
+    /// permanent mode is selected.
+    fn draw_confirm_delete(&self, frame: &mut Frame, permanent: bool) {
+        let dirs = self.selected_dirs();
+        let (count, bytes) = self.selected_total();
+
+        // Show a bounded list of paths so a huge selection can't overflow the
+        // screen; the rest is summarised on a trailing line.
+        const MAX_LISTED: usize = 10;
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            format!(
+                "About to remove {count} director{}:",
+                if count == 1 { "y" } else { "ies" }
+            ),
+            Style::new().fg(Color::White).bold(),
+        )));
+        lines.push(Line::raw(""));
+        for (path, size) in dirs.iter().take(MAX_LISTED) {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:>9}  ", human_size(*size)),
+                    Style::new().fg(Color::Gray),
+                ),
+                Span::styled(self.display_path(path), Style::new().fg(Color::White)),
+            ]));
+        }
+        if dirs.len() > MAX_LISTED {
+            lines.push(Line::from(Span::styled(
+                format!("  … and {} more", dirs.len() - MAX_LISTED),
+                Style::new().fg(Color::DarkGray).italic(),
+            )));
+        }
+
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("Reclaims ", Style::new().fg(Color::Gray)),
+            Span::styled(human_size(bytes), Style::new().fg(Color::Green).bold()),
+            Span::styled(" of disk space.", Style::new().fg(Color::Gray)),
+        ]));
+        lines.push(Line::raw(""));
+
+        let (accent, mode_line) = if permanent {
+            (
+                Color::Red,
+                Line::from(vec![
+                    Span::styled("Mode: ", Style::new().fg(Color::Gray)),
+                    Span::styled(
+                        " PERMANENT DELETE ",
+                        Style::new().bg(Color::Red).fg(Color::White).bold(),
+                    ),
+                    Span::styled(
+                        "  irreversible — files are not recoverable",
+                        Style::new().fg(Color::Rgb(255, 150, 150)),
+                    ),
+                ]),
+            )
+        } else {
+            (
+                Color::Yellow,
+                Line::from(vec![
+                    Span::styled("Mode: ", Style::new().fg(Color::Gray)),
+                    Span::styled(
+                        " Move to Trash ",
+                        Style::new().bg(Color::Yellow).fg(Color::Black).bold(),
+                    ),
+                    Span::styled(
+                        "  recoverable from your system trash",
+                        Style::new().fg(Color::Rgb(210, 210, 160)),
+                    ),
+                ]),
+            )
+        };
+        lines.push(mode_line);
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            Span::styled("  y/↵ ", Style::new().fg(accent).bold()),
+            Span::styled("confirm    ", Style::new().fg(Color::Gray)),
+            Span::styled("t ", Style::new().fg(Color::Cyan).bold()),
+            Span::styled("toggle mode    ", Style::new().fg(Color::Gray)),
+            Span::styled("n/Esc ", Style::new().fg(Color::Cyan).bold()),
+            Span::styled("cancel", Style::new().fg(Color::Gray)),
+        ]));
+
+        let area = centered_rect(frame.area(), 70, lines.len() as u16 + 2);
+        frame.render_widget(Clear, area);
+        let title = if permanent {
+            " ⚠ Permanently delete? "
+        } else {
+            " Move to trash? "
+        };
+        let para = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(accent))
+                .title(Span::styled(title, Style::new().fg(accent).bold()))
+                .style(Style::new().bg(Color::Rgb(24, 18, 22))),
+        );
+        frame.render_widget(para, area);
+    }
+
     /// Display a path relative to the scan root when possible, so the table
     /// stays readable for deep trees.
     fn display_path(&self, path: &Path) -> String {
@@ -915,6 +1316,17 @@ impl App {
 
 fn now() -> SystemTime {
     SystemTime::now()
+}
+
+/// Remove a directory tree, either by moving it to the OS trash (recoverable)
+/// or deleting it permanently. Errors are reported as a string so the caller can
+/// surface them in the UI without depending on the `trash` error type.
+fn delete_path(path: &Path, permanent: bool) -> std::result::Result<(), String> {
+    if permanent {
+        std::fs::remove_dir_all(path).map_err(|e| e.to_string())
+    } else {
+        trash::delete(path).map_err(|e| e.to_string())
+    }
 }
 
 /// Sum of the done-row sizes in a group (pending rows contribute nothing).
@@ -1093,5 +1505,88 @@ mod tests {
         app.reset_filters();
         assert!(!app.group);
         assert_eq!(count(&app), (0, 2));
+    }
+
+    #[test]
+    fn selected_total_sums_only_marked_rows() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        app.rows.push(done_row("Rust / Maven", "target", 250));
+
+        assert_eq!(app.selected_total(), (0, 0));
+
+        app.selected.insert(PathBuf::from("/tmp/target"));
+        assert_eq!(app.selected_total(), (1, 250));
+
+        app.selected.insert(PathBuf::from("/tmp/node_modules"));
+        assert_eq!(app.selected_total(), (2, 350));
+    }
+
+    #[test]
+    fn toggle_group_selection_marks_then_clears_whole_group() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "a", 10));
+        app.rows.push(done_row("Node.js", "b", 20));
+        app.rows.push(done_row("Rust / Maven", "target", 30));
+
+        // First toggle marks every Node.js directory, leaving the other alone.
+        app.toggle_group_selection("Node.js");
+        assert_eq!(app.selected_total(), (2, 30));
+        assert!(!app.selected.contains(&PathBuf::from("/tmp/target")));
+
+        // Toggling again clears the group.
+        app.toggle_group_selection("Node.js");
+        assert_eq!(app.selected_total(), (0, 0));
+    }
+
+    #[test]
+    fn select_all_visible_skips_filtered_out_rows() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "big", 5_000_000));
+        app.rows.push(done_row("Node.js", "small", 10));
+        // A ≥1 MB filter hides the small directory from the view.
+        app.size_filter = SizeFilter::Mb1;
+
+        app.toggle_select_all_visible();
+        // Only the directory that passes the active filter is marked.
+        assert_eq!(app.selected_total(), (1, 5_000_000));
+        assert!(!app.selected.contains(&PathBuf::from("/tmp/small")));
+    }
+
+    #[test]
+    fn permanent_deletion_removes_dir_and_prunes_row() {
+        let tmp = std::env::temp_dir().join(format!("dda-del-test-{}", std::process::id()));
+        let victim = tmp.join("node_modules");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("a.js"), b"hello").unwrap();
+        assert!(victim.exists());
+
+        let mut app = App::new(tmp.clone(), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(Row::Done(DependencyDir {
+            path: victim.clone(),
+            ecosystem: "Node.js",
+            name: "node_modules",
+            size_bytes: 5,
+            file_count: 1,
+            modified: None,
+        }));
+        app.selected.insert(victim.clone());
+
+        app.perform_deletion(true);
+
+        // The directory is gone, the row is pruned and the selection is empty.
+        assert!(!victim.exists());
+        assert!(app.rows.is_empty());
+        assert!(app.selected.is_empty());
+        assert!(app
+            .action
+            .as_deref()
+            .unwrap()
+            .contains("Deleted 1 directory"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }
