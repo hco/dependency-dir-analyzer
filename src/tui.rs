@@ -27,7 +27,14 @@ use crate::scanner::{self, DependencyDir, ScanEvent, ScanOptions};
 use crate::state::{self, AgeFilter, SizeFilter, SortKey, ViewState};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Redraw cadence while something is animating (the scan or a deletion is
+/// running): fast enough for a smooth spinner and live-streaming rows.
 const TICK: Duration = Duration::from_millis(100);
+/// Once the scan is finished and nothing is animating the screen is static, so
+/// the event loop blocks for up to this long waiting for input instead of
+/// busy-redrawing every `TICK` — keeping idle CPU usage near zero. A resize or
+/// key press wakes it sooner.
+const IDLE_TICK: Duration = Duration::from_secs(3600);
 
 /// Foreground/background accents for directories marked for deletion.
 const SELECT_FG: Color = Color::Rgb(255, 120, 120);
@@ -215,20 +222,41 @@ impl App {
         terminal: &mut DefaultTerminal,
         rx: mpsc::Receiver<ScanEvent>,
     ) -> Result<()> {
+        // Draw once up front so there's a UI before we block on the first poll.
+        self.drain(&rx);
+        self.drain_deletion();
+        terminal.draw(|frame| self.draw(frame))?;
+
         loop {
-            self.drain(&rx);
-            self.drain_deletion();
+            // The spinner only animates while the scan or a deletion is running;
+            // the rest of the time the screen is static. When idle we block on
+            // input (up to `IDLE_TICK`) and redraw only in response to an event,
+            // instead of re-rendering at `TICK` forever — which otherwise burns
+            // CPU long after the scan has finished.
+            let animating = self.scanning || self.delete_progress.is_some();
+            let timeout = if animating { TICK } else { IDLE_TICK };
 
-            terminal.draw(|frame| self.draw(frame))?;
-
-            if event::poll(TICK)? {
+            // An event (key press, resize, …) means the view may have changed.
+            let mut dirty = false;
+            if event::poll(timeout)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press && self.handle_key(key.code, key.modifiers) {
                         return Ok(());
                     }
                 }
+                dirty = true;
             }
-            self.spinner = (self.spinner + 1) % SPINNER.len();
+
+            // Scan results and deletion outcomes can arrive between polls.
+            self.drain(&rx);
+            self.drain_deletion();
+
+            if animating {
+                self.spinner = (self.spinner + 1) % SPINNER.len();
+                terminal.draw(|frame| self.draw(frame))?;
+            } else if dirty {
+                terminal.draw(|frame| self.draw(frame))?;
+            }
         }
     }
 
@@ -599,7 +627,7 @@ impl App {
             };
             match rx.try_recv() {
                 Ok(DeleteOutcome::Removed { path, size }) => {
-                    self.remove_rows(&[path.clone()]);
+                    self.remove_rows(std::slice::from_ref(&path));
                     self.selected.remove(&path);
                     if let Some(p) = &mut self.delete_progress {
                         p.done += 1;
@@ -682,7 +710,7 @@ impl App {
     /// off this is just the filtered, sorted, top-capped directory rows followed
     /// by any still-pending rows. When grouping is on, rows are bucketed by
     /// ecosystem (groups ordered by total size) with a subtotal header each.
-    fn display_items(&self, now: SystemTime) -> Vec<DisplayItem> {
+    fn display_items(&self, now: SystemTime) -> Vec<DisplayItem<'_>> {
         let done: Vec<&Row> = self
             .rows
             .iter()
