@@ -362,11 +362,11 @@ impl App {
             KeyCode::Char('A') => self.toggle_select_all_visible(),
             KeyCode::Char('c') => self.clear_selection(),
             KeyCode::Char('d') | KeyCode::Delete => self.open_confirm_delete(),
-            KeyCode::Char('s') => self.sort = self.sort.next(),
+            KeyCode::Char('S') => self.sort = self.sort.next(),
             KeyCode::Char('u') => self.size_unit = self.size_unit.toggle(),
             KeyCode::Char('i') => self.icon_style = self.icon_style.cycle(),
             KeyCode::Char('g') => self.group = !self.group,
-            KeyCode::Char('f') => self.size_filter = self.size_filter.next(),
+            KeyCode::Char('s') => self.size_filter = self.size_filter.next(),
             KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
             KeyCode::Char('e') => self.overlay = Overlay::Ecosystems { cursor: 0 },
             KeyCode::Char('r') => self.reset_filters(),
@@ -856,7 +856,7 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(4),
             Constraint::Min(1),
             Constraint::Length(5),
         ])
@@ -938,7 +938,7 @@ impl App {
         } else {
             " ✓ done".to_string()
         };
-        let line = Line::from(vec![
+        let title = Line::from(vec![
             Span::styled(
                 " dda ",
                 Style::new().bg(Color::Cyan).fg(Color::Black).bold(),
@@ -958,13 +958,67 @@ impl App {
                 }),
             ),
         ]);
-        let para = Paragraph::new(line).block(
+        let text = Text::from(vec![title, self.filter_line()]);
+        let para = Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(Style::new().fg(Color::DarkGray))
                 .title(" dependency-dir-analyzer "),
         );
         frame.render_widget(para, area);
+    }
+
+    /// The filter bar shown as the second header line: each row filter labelled
+    /// with its keyboard shortcut, so `f`/`a`/`e` (and `r` to reset) are visible
+    /// without opening help. Active filters are highlighted; the reset hint lights
+    /// up only when there is something to reset.
+    fn filter_line(&self) -> Line<'static> {
+        let eco_active = !self.disabled_ecos.is_empty();
+        let eco_value = if eco_active {
+            format!("{} hidden", self.disabled_ecos.len())
+        } else {
+            "all".to_string()
+        };
+
+        let mut spans = vec![Span::styled(
+            "Filters:   ",
+            Style::new().fg(Color::Gray).bold(),
+        )];
+        spans.extend(top_filter_chip(
+            "s",
+            "size",
+            self.size_filter.label(),
+            self.size_filter != SizeFilter::All,
+        ));
+        spans.push(Span::raw("  "));
+        spans.extend(top_filter_chip(
+            "a",
+            "age",
+            self.age_filter.label(),
+            self.age_filter != AgeFilter::Any,
+        ));
+        spans.push(Span::raw("  "));
+        spans.extend(top_filter_chip("e", "eco", &eco_value, eco_active));
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            "[r]",
+            Style::new()
+                .fg(if self.has_filters() {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })
+                .bold(),
+        ));
+        spans.push(Span::styled(
+            " reset",
+            Style::new().fg(if self.has_filters() {
+                Color::Gray
+            } else {
+                Color::DarkGray
+            }),
+        ));
+        Line::from(spans)
     }
 
     /// Ensure the current selection points at a valid row, snapping it back into
@@ -1221,25 +1275,6 @@ impl App {
                 Style::new().fg(Color::Blue),
             ),
         ]);
-        chips.push(Span::raw("  "));
-        chips.push(filter_chip(
-            "size",
-            self.size_filter.label(),
-            self.size_filter != SizeFilter::All,
-        ));
-        chips.push(Span::raw("  "));
-        chips.push(filter_chip(
-            "age",
-            self.age_filter.label(),
-            self.age_filter != AgeFilter::Any,
-        ));
-        if !self.disabled_ecos.is_empty() {
-            chips.push(Span::raw("  "));
-            chips.push(Span::styled(
-                format!("eco:−{}", self.disabled_ecos.len()),
-                Style::new().fg(Color::Yellow),
-            ));
-        }
         if self.warnings > 0 {
             chips.push(Span::raw("  "));
             chips.push(Span::styled(
@@ -1261,7 +1296,7 @@ impl App {
         // (which the footer chip already advertises with "press d to delete")
         // below.
         let hints_view = Line::from(vec![Span::styled(
-            "↑/↓ move   s sort   g group   u unit   i icons   ↵ fold   f size   a age   e ecosystem   r reset",
+            "↑/↓ move   S sort   g group   u unit   i icons   ↵ fold",
             Style::new().fg(Color::DarkGray),
         )]);
         let delete_hint = if sel_count > 0 {
@@ -1293,12 +1328,12 @@ impl App {
             help_line("PgUp / PgDn", "jump 10 rows"),
             help_line("Home / End", "first / last row"),
             Line::raw(""),
-            help_line("s", "cycle sort (size · modified · name · files)"),
+            help_line("S", "cycle sort (size · modified · name · files)"),
             help_line("u", "toggle size units (MB · auto)"),
             help_line("i", "cycle ecosystem icons (emoji · nerd · off)"),
             help_line("g", "toggle grouping by ecosystem"),
             help_line("Enter / Space", "fold/unfold selected group"),
-            help_line("f", "cycle minimum-size filter"),
+            help_line("s", "cycle minimum-size filter"),
             help_line("a", "cycle \"modified older than\" filter"),
             help_line("e", "open ecosystem filter (multi-select)"),
             help_line("r", "reset all filters & grouping"),
@@ -1555,15 +1590,20 @@ fn group_total(rows: &[&Row]) -> u64 {
         .sum()
 }
 
-/// A small `label:value` chip for the footer, highlighted when the filter is
-/// active.
-fn filter_chip(label: &str, value: &str, active: bool) -> Span<'static> {
-    let style = if active {
+/// One filter entry for the top header bar: the bracketed keyboard shortcut, the
+/// filter's name, and its current value as a chip (highlighted when the filter is
+/// doing something).
+fn top_filter_chip(key: &str, label: &str, value: &str, active: bool) -> Vec<Span<'static>> {
+    let value_style = if active {
         Style::new().fg(Color::Black).bg(Color::Yellow).bold()
     } else {
         Style::new().fg(Color::DarkGray)
     };
-    Span::styled(format!(" {label}:{value} "), style)
+    vec![
+        Span::styled(format!("[{key}] "), Style::new().fg(Color::Cyan).bold()),
+        Span::styled(format!("{label} "), Style::new().fg(Color::Gray)),
+        Span::styled(format!(" {value} "), value_style),
+    ]
 }
 
 fn help_line(keys: &'static str, desc: &'static str) -> Line<'static> {
