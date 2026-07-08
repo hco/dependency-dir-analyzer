@@ -11,6 +11,8 @@ reclaimable space across a folder full of projects.
 
 The binary is called **`dda`**.
 
+![dda scanning a project tree, marking directories, and confirming a trash-it deletion](demo/demo.gif)
+
 ## Features
 
 - **Interactive, live-updating TUI** — results stream in and re-sort as the
@@ -31,23 +33,9 @@ The binary is called **`dda`**.
 
 ## Example
 
-On a terminal, `dda` opens an interactive view that fills in as it scans:
-
-```text
-┌ dependency-dir-analyzer ──────────────────────────────────────────────────┐
-│ dda   ~/code   ⠹ scanning                                                  │
-├────────────────────────────────────────────────────────────────────────────┤
-│ Size       ▏          Files  Modified  Ecosystem    Path                    │
-│ 1.2 GB     ████████   48210  2d ago    Node.js      web-app/node_modules    │
-│ 420 MB     ███        1182   5mo ago   Rust / Maven cli-tool/target         │
-│ 180 MB     █          640    1y ago    Python (venv).venv                   │
-│ ⠹ sizing…             —      —         Go / PHP …   api/vendor              │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 1.84 GB    ✗ 2 marked · 1.62 GB    3 shown · 3 sized · 4 found   sort: size  │
-│ ↑/↓ move   s sort   g group   ↵ fold   f size   a age   e ecosystem   r reset│
-│ space/x mark   A all   c clear   d delete   ? help   q quit                  │
-└────────────────────────────────────────────────────────────────────────────┘
-```
+On a terminal, `dda` opens the interactive view shown above: results stream in
+and re-sort as the scan runs, you mark what you want gone, and a confirmation
+step shows the space it frees before anything is deleted.
 
 Piped or redirected, it prints a plain aligned table instead:
 
@@ -184,6 +172,12 @@ mise run test     # run tests
 mise run ci       # fmt-check + lint + test + release build (mirrors CI)
 mise tasks        # list all tasks
 ```
+
+The demo GIF at the top is rendered with [VHS](https://github.com/charmbracelet/vhs)
+from [`demo/demo.tape`](demo/demo.tape). Regenerate it with `mise run demo`,
+which builds the release binary, generates a throwaway fake project tree
+(`demo/make-fixture.sh`, not committed), then records the GIF. This needs `vhs`
+(pinned in `mise.toml`) plus `ttyd` and `ffmpeg` on `PATH` (`brew install ttyd ffmpeg`).
 
 See [CLAUDE.md](CLAUDE.md) for a fuller tour of the codebase.
 

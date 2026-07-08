@@ -56,6 +56,10 @@ src/
 .claude/
   hooks/session-start.sh   # installs mise + deps in Claude Code on the web
   settings.json            # registers the SessionStart hook
+demo/
+  demo.tape       # VHS script for the README GIF (`mise run demo`)
+  make-fixture.sh # builds the git-ignored fake project tree the demo scans
+  demo.gif        # committed; rendered output the README links to
 mise.toml       # toolchain + tasks
 ```
 

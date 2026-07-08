@@ -14,6 +14,11 @@ rust = { version = "1.88", components = "rustfmt,clippy" }
 # binaries and publishes the Homebrew formula. Pinned so local `dist generate`
 # output matches what CI runs. Regenerate the release workflow after bumping.
 cargo-dist = "0.32.0"
+# `vhs` renders the README demo GIF from demo/demo.tape (`mise run demo`). Only
+# needed to regenerate the GIF — not part of the build or CI. vhs also needs
+# `ttyd` and `ffmpeg` on PATH; install those from your OS package manager
+# (macOS: `brew install ttyd ffmpeg`), as neither ships a macOS binary here.
+vhs = "0.11.0"
 
 [env]
 # Keep cargo's output inside the repo so caching in CI is straightforward.
@@ -55,6 +60,15 @@ run = "cargo check --all-targets"
 [tasks.ci]
 description = "Run the full CI suite: format check, lint, test, build"
 depends = ["fmt-check", "lint", "test", "release"]
+
+[tasks.demo-fixture]
+description = "Generate the git-ignored fake project tree used by the demo GIF"
+run = "bash demo/make-fixture.sh"
+
+[tasks.demo]
+description = "Render the README demo GIF with VHS (builds the binary + fixture first)"
+depends = ["release", "demo-fixture"]
+run = "vhs demo/demo.tape"
 
 [tasks.clean]
 description = "Remove build artifacts"
