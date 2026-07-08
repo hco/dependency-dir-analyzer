@@ -46,7 +46,8 @@ fn main() -> Result<()> {
     let interactive = args.format == Format::Table && !args.plain && io::stdout().is_terminal();
 
     if interactive {
-        tui::run(&args.path, opts, args.top, min_size).context("interactive UI failed")?;
+        tui::run(&args.path, opts, args.top, min_size, args.icons)
+            .context("interactive UI failed")?;
         return Ok(());
     }
 

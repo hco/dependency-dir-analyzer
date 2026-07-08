@@ -24,7 +24,7 @@ use ratatui::DefaultTerminal;
 
 use crate::report::{group_thousands, human_size, megabytes_size, relative_age};
 use crate::scanner::{self, DependencyDir, ScanEvent, ScanOptions};
-use crate::state::{self, AgeFilter, SizeFilter, SizeUnit, SortKey, ViewState};
+use crate::state::{self, AgeFilter, IconStyle, SizeFilter, SizeUnit, SortKey, ViewState};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Redraw cadence while something is animating (the scan or a deletion is
@@ -48,6 +48,7 @@ pub fn run(
     opts: ScanOptions,
     top: usize,
     min_size: u64,
+    icons: Option<IconStyle>,
 ) -> Result<Vec<DependencyDir>> {
     let (tx, rx) = mpsc::channel();
     let root_buf = root.to_path_buf();
@@ -55,8 +56,12 @@ pub fn run(
         scanner::scan_streaming(&root_buf, &opts, tx);
     });
 
-    // Restore the view preferences last used for this directory.
-    let view = state::load(root);
+    // Restore the view preferences last used for this directory. A `--icons`
+    // flag overrides the remembered icon style just for this run.
+    let mut view = state::load(root);
+    if let Some(style) = icons {
+        view.icon_style = style;
+    }
 
     let mut terminal = ratatui::init();
     let mut app = App::new(root.to_path_buf(), top, min_size, view);
@@ -157,6 +162,8 @@ struct App {
     age_filter: AgeFilter,
     /// How the size column renders byte counts (whole MB vs adaptive humansize).
     size_unit: SizeUnit,
+    /// Which icon (if any) precedes the ecosystem label.
+    icon_style: IconStyle,
     /// Ecosystems the user has toggled *off* in the ecosystem panel. Empty means
     /// every ecosystem is shown. Stored by label so it survives across restarts.
     disabled_ecos: HashSet<String>,
@@ -194,6 +201,7 @@ impl App {
             size_filter: view.size_filter,
             age_filter: view.age_filter,
             size_unit: view.size_unit,
+            icon_style: view.icon_style,
             disabled_ecos: view.disabled_ecos,
             collapsed_ecos: view.collapsed_ecos,
             selected: HashSet::new(),
@@ -216,6 +224,7 @@ impl App {
             size_filter: self.size_filter,
             age_filter: self.age_filter,
             size_unit: self.size_unit,
+            icon_style: self.icon_style,
             disabled_ecos: self.disabled_ecos.clone(),
             collapsed_ecos: self.collapsed_ecos.clone(),
         }
@@ -355,6 +364,7 @@ impl App {
             KeyCode::Char('d') | KeyCode::Delete => self.open_confirm_delete(),
             KeyCode::Char('s') => self.sort = self.sort.next(),
             KeyCode::Char('u') => self.size_unit = self.size_unit.toggle(),
+            KeyCode::Char('i') => self.icon_style = self.icon_style.cycle(),
             KeyCode::Char('g') => self.group = !self.group,
             KeyCode::Char('f') => self.size_filter = self.size_filter.next(),
             KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
@@ -1009,7 +1019,7 @@ impl App {
 
         // Bar column width derives from the available area (the leading
         // checkbox column and its spacing take a few more cells than before).
-        let bar_width = (area.width as usize).saturating_sub(71).clamp(6, 24);
+        let bar_width = (area.width as usize).saturating_sub(74).clamp(6, 24);
 
         // Collect into an owned Vec so the immutable borrow of `self`/`items`
         // ends before the table is rendered with `&mut self.state` below.
@@ -1035,7 +1045,7 @@ impl App {
             Constraint::Length(bar_width as u16),
             Constraint::Length(10),
             Constraint::Length(10),
-            Constraint::Length(16),
+            Constraint::Length(19),
             Constraint::Min(20),
         ];
 
@@ -1088,7 +1098,7 @@ impl App {
                     )
                     .style(Style::new().fg(Color::Gray)),
                     Cell::from(""),
-                    Cell::from(format!("{glyph} {ecosystem}"))
+                    Cell::from(format!("{glyph} {}", self.eco_label(ecosystem)))
                         .style(Style::new().fg(Color::Cyan).bold()),
                     Cell::from(""),
                 ])
@@ -1113,7 +1123,7 @@ impl App {
                         .style(Style::new().fg(Color::Gray)),
                     Cell::from(relative_age(d.modified))
                         .style(Style::new().fg(age_color(d.modified))),
-                    Cell::from(d.ecosystem).style(Style::new().fg(Color::Cyan)),
+                    Cell::from(self.eco_label(d.ecosystem)).style(Style::new().fg(Color::Cyan)),
                     Cell::from(format!("{indent}{}", self.display_path(&d.path))),
                 ]);
                 // Tint marked rows so the deletion set stands out even when the
@@ -1131,7 +1141,7 @@ impl App {
                 Cell::from(build_bar(0.0, bar_width)),
                 Cell::from(Text::from("—").right_aligned()).style(Style::new().fg(Color::DarkGray)),
                 Cell::from("—").style(Style::new().fg(Color::DarkGray)),
-                Cell::from(*ecosystem).style(Style::new().fg(Color::DarkGray)),
+                Cell::from(self.eco_label(ecosystem)).style(Style::new().fg(Color::DarkGray)),
                 Cell::from(self.display_path(path)).style(Style::new().fg(Color::DarkGray)),
             ]),
         }
@@ -1205,6 +1215,11 @@ impl App {
                 format!("unit:{}", self.size_unit.label()),
                 Style::new().fg(Color::Blue),
             ),
+            Span::raw("  "),
+            Span::styled(
+                format!("icons:{}", self.icon_style.label()),
+                Style::new().fg(Color::Blue),
+            ),
         ]);
         chips.push(Span::raw("  "));
         chips.push(filter_chip(
@@ -1246,7 +1261,7 @@ impl App {
         // (which the footer chip already advertises with "press d to delete")
         // below.
         let hints_view = Line::from(vec![Span::styled(
-            "↑/↓ move   s sort   g group   u unit   ↵ fold   f size   a age   e ecosystem   r reset",
+            "↑/↓ move   s sort   g group   u unit   i icons   ↵ fold   f size   a age   e ecosystem   r reset",
             Style::new().fg(Color::DarkGray),
         )]);
         let delete_hint = if sel_count > 0 {
@@ -1280,6 +1295,7 @@ impl App {
             Line::raw(""),
             help_line("s", "cycle sort (size · modified · name · files)"),
             help_line("u", "toggle size units (MB · auto)"),
+            help_line("i", "cycle ecosystem icons (emoji · nerd · off)"),
             help_line("g", "toggle grouping by ecosystem"),
             help_line("Enter / Space", "fold/unfold selected group"),
             help_line("f", "cycle minimum-size filter"),
@@ -1347,7 +1363,7 @@ impl App {
                             }),
                         ),
                         Span::styled(
-                            *eco,
+                            self.eco_label(eco),
                             Style::new().fg(if enabled {
                                 Color::White
                             } else {
@@ -1483,6 +1499,16 @@ impl App {
                 .style(Style::new().bg(Color::Rgb(24, 18, 22))),
         );
         frame.render_widget(para, area);
+    }
+
+    /// The ecosystem label, prefixed with its icon unless icons are off.
+    fn eco_label(&self, ecosystem: &str) -> String {
+        let icon = self.icon_style.icon(ecosystem);
+        if icon.is_empty() {
+            ecosystem.to_string()
+        } else {
+            format!("{icon} {ecosystem}")
+        }
     }
 
     /// Render a byte count for the size column, honouring the current unit mode.

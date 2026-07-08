@@ -69,6 +69,101 @@ impl SizeUnit {
     }
 }
 
+/// How (and whether) an icon is shown next to each ecosystem. Cycled with `i`
+/// in the TUI and settable up front with `--icons`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+pub enum IconStyle {
+    /// No icons. The default — a terminal program can't reliably tell whether
+    /// the font can render emoji or Nerd Font glyphs, so we stay plain unless
+    /// asked (via `--icons` or the `i` toggle).
+    #[default]
+    Off,
+    /// Colour emoji (e.g. 🦀, 🐍) — works in any modern terminal, no font
+    /// install required.
+    Emoji,
+    /// Nerd Font glyphs — single-width and themeable, but only render if the
+    /// terminal is using a patched Nerd Font (otherwise they show as boxes).
+    Nerd,
+}
+
+impl IconStyle {
+    /// Advance to the next style, cycling emoji → nerd → off → emoji.
+    pub fn cycle(self) -> Self {
+        match self {
+            IconStyle::Emoji => IconStyle::Nerd,
+            IconStyle::Nerd => IconStyle::Off,
+            IconStyle::Off => IconStyle::Emoji,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IconStyle::Emoji => "emoji",
+            IconStyle::Nerd => "nerd",
+            IconStyle::Off => "off",
+        }
+    }
+
+    /// The glyph to show for `ecosystem`, or `""` when icons are off. The Nerd
+    /// Font codepoints are the common devicon set; tweak the table to match your
+    /// font if any render as the wrong glyph.
+    pub fn icon(self, ecosystem: &str) -> &'static str {
+        match self {
+            IconStyle::Off => "",
+            IconStyle::Emoji => emoji_icon(ecosystem),
+            IconStyle::Nerd => nerd_icon(ecosystem),
+        }
+    }
+}
+
+/// Emoji icon for an ecosystem label. Uses single-codepoint, double-width emoji
+/// (no variation selectors) so the column stays aligned, with a package
+/// fallback for anything unmapped.
+fn emoji_icon(ecosystem: &str) -> &'static str {
+    if ecosystem.starts_with("Python") {
+        return "🐍";
+    }
+    match ecosystem {
+        "Node.js" => "🟢",
+        "Bower" => "🐦",
+        "Next.js" => "🔺",
+        "Nuxt" => "💚",
+        "SvelteKit" => "🧡",
+        "Angular" => "🔻",
+        "Rust / Maven" | "Cargo (cache)" => "🦀",
+        "Go / PHP / Ruby" => "🐹",
+        "Ruby (Bundler)" => "💎",
+        "Gradle" => "🐘",
+        "Dart / Flutter" => "🎯",
+        "Elm" => "🌳",
+        "CocoaPods" => "🍫",
+        "Terraform" => "🌍",
+        "Xcode" => "🔨",
+        _ => "📦",
+    }
+}
+
+/// Nerd Font glyph for an ecosystem label, with a generic package glyph
+/// (nf-oct-package) as the fallback.
+fn nerd_icon(ecosystem: &str) -> &'static str {
+    if ecosystem.starts_with("Python") {
+        return "\u{e606}"; // nf-seti-python
+    }
+    match ecosystem {
+        "Node.js" | "Next.js" | "Nuxt" | "SvelteKit" | "Bower" => "\u{e718}", // nf-dev-nodejs_small
+        "Angular" => "\u{e753}",                                              // nf-dev-angular
+        "Rust / Maven" | "Cargo (cache)" => "\u{e7a8}",                       // nf-dev-rust
+        "Go / PHP / Ruby" => "\u{e724}",                                      // nf-dev-go
+        "Ruby (Bundler)" => "\u{e739}",                                       // nf-dev-ruby
+        "Gradle" => "\u{e660}",                                               // nf-seti-gradle
+        "Dart / Flutter" => "\u{e798}",                                       // nf-dev-dart
+        "Elm" => "\u{e62c}",                                                  // nf-seti-elm
+        "CocoaPods" | "Xcode" => "\u{e711}",                                  // nf-dev-apple
+        "Terraform" => "\u{e69a}",                                            // nf-seti-terraform
+        _ => "\u{f487}",                                                      // nf-oct-package
+    }
+}
+
 /// Minimum-size threshold cycler applied on top of the CLI `--min-size`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SizeFilter {
@@ -176,6 +271,7 @@ pub struct ViewState {
     pub disabled_ecos: HashSet<String>,
     pub collapsed_ecos: HashSet<String>,
     pub size_unit: SizeUnit,
+    pub icon_style: IconStyle,
 }
 
 /// Load the saved view state for `root`, or defaults if none is stored.
@@ -243,6 +339,22 @@ mod tests {
         assert_eq!(k, SortKey::Modified);
         k = k.next().next().next();
         assert_eq!(k, SortKey::Size);
+    }
+
+    #[test]
+    fn icon_style_cycles_and_maps_ecosystems() {
+        // emoji → nerd → off → emoji
+        assert_eq!(IconStyle::Emoji.cycle(), IconStyle::Nerd);
+        assert_eq!(IconStyle::Nerd.cycle(), IconStyle::Off);
+        assert_eq!(IconStyle::Off.cycle(), IconStyle::Emoji);
+
+        // Off never shows a glyph; the other styles always do (fallback covers
+        // unmapped labels).
+        assert_eq!(IconStyle::Off.icon("Rust / Maven"), "");
+        assert_eq!(IconStyle::Emoji.icon("Rust / Maven"), "🦀");
+        assert_eq!(IconStyle::Emoji.icon("Python (pytest)"), "🐍");
+        assert!(!IconStyle::Emoji.icon("Totally Unknown").is_empty());
+        assert!(!IconStyle::Nerd.icon("Totally Unknown").is_empty());
     }
 
     #[test]

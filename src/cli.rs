@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
+use crate::state::IconStyle;
+
 /// Scan a directory tree for dependency directories and report how much space
 /// they use.
 ///
@@ -38,6 +40,11 @@ pub struct Cli {
     /// Follow symbolic links while scanning.
     #[arg(long)]
     pub follow_symlinks: bool,
+
+    /// Ecosystem icon style in the interactive UI (emoji, nerd or off).
+    /// Overrides the remembered setting for this run; toggle live with `i`.
+    #[arg(long, value_enum, value_name = "STYLE")]
+    pub icons: Option<IconStyle>,
 
     /// Print a plain static table instead of the interactive TUI, even on a
     /// terminal.
