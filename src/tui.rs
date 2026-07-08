@@ -153,6 +153,12 @@ enum DisplayItem<'a> {
 struct App {
     root: PathBuf,
     rows: Vec<Row>,
+    /// Path → position in `rows`, so a `Sized` event can update the matching
+    /// discovered row in O(1) instead of scanning the whole list. Sizing
+    /// completions arrive in bursts, and on a large tree an O(n) search per
+    /// completion adds up to O(n²) work that stalls the UI thread. Rebuilt
+    /// whenever rows are removed (see [`App::remove_rows`]).
+    index: HashMap<PathBuf, usize>,
     warnings: usize,
     last_warning: Option<String>,
     scanning: bool,
@@ -193,6 +199,7 @@ impl App {
         App {
             root,
             rows: Vec::new(),
+            index: HashMap::new(),
             warnings: 0,
             last_warning: None,
             scanning: true,
@@ -293,12 +300,14 @@ impl App {
             ScanEvent::Discovered {
                 path, ecosystem, ..
             } => {
+                self.index.insert(path.clone(), self.rows.len());
                 self.rows.push(Row::Pending { path, ecosystem });
             }
             ScanEvent::Sized(dir) => {
-                if let Some(row) = self.rows.iter_mut().find(|r| r.path() == dir.path) {
-                    *row = Row::Done(dir);
+                if let Some(&i) = self.index.get(&dir.path) {
+                    self.rows[i] = Row::Done(dir);
                 } else {
+                    self.index.insert(dir.path.clone(), self.rows.len());
                     self.rows.push(Row::Done(dir));
                 }
             }
@@ -698,6 +707,17 @@ impl App {
             return;
         }
         self.rows.retain(|r| !paths.iter().any(|p| p == r.path()));
+        // Retaining shifts positions, so the path→row index is now stale.
+        // Removals are user-initiated and rare, so a full rebuild is fine.
+        self.rebuild_index();
+    }
+
+    /// Rebuild the path→row index from scratch to match the current `rows`.
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (i, row) in self.rows.iter().enumerate() {
+            self.index.insert(row.path().to_path_buf(), i);
+        }
     }
 
     /// Whether a completed directory passes the active filters.
@@ -863,8 +883,12 @@ impl App {
         .split(frame.area());
 
         self.draw_header(frame, chunks[0]);
-        self.draw_table(frame, chunks[1]);
-        self.draw_footer(frame, chunks[2]);
+        // `draw_table` builds the view model (filter + sort + group) once and
+        // reports how many data rows it showed, so `draw_footer` doesn't have to
+        // recompute it. On a large tree this alone cuts the per-frame sort/group
+        // work by two thirds.
+        let shown = self.draw_table(frame, chunks[1]);
+        self.draw_footer(frame, chunks[2], shown);
 
         // An in-flight deletion takes over the screen, superseding any overlay.
         if self.delete_progress.is_some() {
@@ -1023,8 +1047,9 @@ impl App {
 
     /// Ensure the current selection points at a valid row, snapping it back into
     /// range when the view has shrunk (e.g. after a filter change or a fold).
-    fn clamp_selection(&mut self) {
-        let len = self.visible_len();
+    /// Takes the already-computed row count so the caller doesn't rebuild the
+    /// view model just to clamp.
+    fn clamp_selection_to(&mut self, len: usize) {
         match self.state.selected() {
             _ if len == 0 => self.state.select(None),
             Some(i) if i >= len => self.state.select(Some(len - 1)),
@@ -1033,13 +1058,15 @@ impl App {
         }
     }
 
-    fn draw_table(&mut self, frame: &mut Frame, area: Rect) {
-        // Clamp the selection first so the borrow below stays immutable.
-        self.clamp_selection();
-
+    /// Render the results table and return how many data rows were shown (used
+    /// by the footer so it doesn't have to rebuild the view model).
+    fn draw_table(&mut self, frame: &mut Frame, area: Rect) -> usize {
+        // Build the view model once per frame; everything below reads from it.
         let items = self.display_items(now());
+        let len = items.len();
 
         if items.is_empty() {
+            self.state.select(None);
             let msg = if self.scanning {
                 "Scanning…".to_string()
             } else if self.has_filters() {
@@ -1059,7 +1086,7 @@ impl App {
                 )
                 .wrap(Wrap { trim: true });
             frame.render_widget(para, area);
-            return;
+            return 0;
         }
 
         let max_size = items
@@ -1081,6 +1108,13 @@ impl App {
             .iter()
             .map(|it| self.render_item(it, max_size, bar_width))
             .collect();
+        let shown = items
+            .iter()
+            .filter(|it| matches!(it, DisplayItem::Data(_)))
+            .count();
+        // `items` is no longer used past here, so its borrow of `self` ends and
+        // we can take `&mut self.state` for clamping and rendering.
+        self.clamp_selection_to(len);
 
         let header = TableRow::new(vec![
             Cell::from(""),
@@ -1115,6 +1149,7 @@ impl App {
             );
 
         frame.render_stateful_widget(table, area, &mut self.state);
+        shown
     }
 
     fn render_item(
@@ -1207,17 +1242,12 @@ impl App {
             || !self.disabled_ecos.is_empty()
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+    fn draw_footer(&self, frame: &mut Frame, area: Rect, shown: usize) {
         let now = now();
         let sized = self
             .rows
             .iter()
             .filter(|r| matches!(r, Row::Done(_)))
-            .count();
-        let items = self.display_items(now);
-        let shown = items
-            .iter()
-            .filter(|it| matches!(it, DisplayItem::Data(_)))
             .count();
         // Total reflects what is currently shown (filtered), so the header chip
         // tracks the reclaimable space for the active view.
@@ -1699,6 +1729,53 @@ mod tests {
     #[test]
     fn bar_zero_width_is_empty() {
         assert_eq!(build_bar(0.7, 0), "");
+    }
+
+    #[test]
+    fn sized_event_updates_matching_row_via_index() {
+        // A discovered-then-sized round trip must land on the right row, and the
+        // path→row index must survive a row being removed mid-scan (which shifts
+        // every later position). Regression guard for the O(1) index in `apply`.
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+
+        for name in ["a", "b", "c"] {
+            app.apply(ScanEvent::Discovered {
+                path: PathBuf::from(format!("/tmp/{name}")),
+                ecosystem: "Node.js",
+            });
+        }
+
+        // Remove the first row; the remaining rows shift down by one.
+        app.remove_rows(&[PathBuf::from("/tmp/a")]);
+
+        // Sizing the last-discovered directory must update *its* row, not a
+        // stale position left over from before the removal.
+        let sized = DependencyDir {
+            path: PathBuf::from("/tmp/c"),
+            ecosystem: "Node.js",
+            name: "node_modules",
+            size_bytes: 42,
+            file_count: 3,
+            modified: None,
+        };
+        app.apply(ScanEvent::Sized(sized));
+
+        // Exactly the two surviving rows exist, and only "c" is Done with the
+        // right size — nothing was duplicated or mis-targeted.
+        assert_eq!(app.rows.len(), 2);
+        let c = app
+            .rows
+            .iter()
+            .find(|r| r.path() == Path::new("/tmp/c"))
+            .expect("c row present");
+        match c {
+            Row::Done(d) => assert_eq!(d.size_bytes, 42),
+            Row::Pending { .. } => panic!("c should be sized"),
+        }
+        assert!(matches!(
+            app.rows.iter().find(|r| r.path() == Path::new("/tmp/b")),
+            Some(Row::Pending { .. })
+        ));
     }
 
     #[test]
