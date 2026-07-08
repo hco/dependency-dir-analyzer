@@ -7,6 +7,7 @@ description = "Scan a directory tree for dependency directories (node_modules, t
 authors = ["Hans-Christian Otto"]
 license = "MIT"
 repository = "https://github.com/hco/dependency-dir-analyzer"
+homepage = "https://github.com/hco/dependency-dir-analyzer"
 readme = "README.md"
 keywords = ["cli", "disk-usage", "dependencies", "node_modules", "cleanup"]
 categories = ["command-line-utilities", "filesystem"]
@@ -39,3 +40,10 @@ opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+# Fully inherit [profile.release] (fat LTO, codegen-units=1, strip) so the
+# binaries dist ships are identical to a local release build. dist defaults
+# this to thin LTO for build speed, which this small crate doesn't need.
+inherits = "release"

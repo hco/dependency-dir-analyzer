@@ -87,16 +87,36 @@ mise.toml       # toolchain + tasks
 
 ## Releases
 
-Releases are produced by `.github/workflows/release.yml` when a `v*.*.*` tag is
-pushed. It cross-compiles for Linux (x86_64, aarch64), macOS (x86_64, aarch64)
-and Windows (x86_64), then attaches archives + SHA-256 checksums to a GitHub
-Release. To cut a release:
+Releases are driven by [`dist`](https://opensource.axo.dev/cargo-dist/)
+(formerly cargo-dist). Config lives in `dist-workspace.toml`; the pinned `dist`
+version is in `mise.toml` (`cargo-dist`) and the CI workflow
+(`.github/workflows/release.yml`) is **generated** from that config — never
+hand-edit it. When a `v*.*.*` tag is pushed, `dist` cross-compiles for Linux
+(x86_64, aarch64), macOS (x86_64, aarch64) and Windows (x86_64), attaches
+archives + SHA-256 checksums to a GitHub Release, and publishes a Homebrew
+formula (`dda`) to the `hco/homebrew-tap` repo so `brew install hco/tap/dda`
+works.
+
+To cut a release:
 
 ```bash
 # bump version in Cargo.toml first, then:
 git tag v0.1.0
 git push origin v0.1.0
 ```
+
+After changing `dist-workspace.toml` or bumping the pinned `cargo-dist` version
+in `mise.toml`, regenerate the workflow and commit the result:
+
+```bash
+dist generate            # rewrites .github/workflows/release.yml
+dist generate --check    # CI-style check that it is up to date
+```
+
+**One-time setup for the Homebrew tap** (already documented, must exist for the
+publish job to work): a `hco/homebrew-tap` GitHub repo, plus a
+`HOMEBREW_TAP_TOKEN` Actions secret (a PAT with write access to that repo) in
+this repository — the default `GITHUB_TOKEN` cannot push to another repo.
 
 ## Claude Code on the web
 

@@ -152,10 +152,17 @@ does not descend further, so nested matches are never double-counted.
 
 ## Install
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install hco/tap/dda
+```
+
 ### From a release
 
 Download the archive for your platform from the
 [Releases](../../releases) page, extract it, and put `dda` on your `PATH`.
+Each archive ships alongside a SHA-256 checksum.
 
 ### From source
 
