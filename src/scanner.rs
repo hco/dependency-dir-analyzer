@@ -197,20 +197,21 @@ pub enum ScanEvent {
     Warning(String),
 }
 
-/// Walk `root` and collect the paths of every dependency directory beneath it.
+/// Walk `root` and invoke `on_match` for every dependency directory beneath it,
+/// as each one is found.
 ///
-/// When a dependency directory is found it is recorded and the walk does *not*
-/// descend into it — the whole subtree is accounted for as a single unit, and
-/// nested dependency directories (e.g. a `node_modules` inside another
-/// `node_modules`) are not reported separately. Unreadable entries invoke
-/// `on_warning` rather than aborting the scan.
-fn collect_matches(
+/// When a dependency directory is found the walk does *not* descend into it —
+/// the whole subtree is accounted for as a single unit, and nested dependency
+/// directories (e.g. a `node_modules` inside another `node_modules`) are not
+/// reported separately. Unreadable entries invoke `on_warning` rather than
+/// aborting the scan. Reporting matches through a callback lets streaming
+/// consumers act on each one immediately instead of waiting for the full walk.
+fn walk_matches(
     root: &Path,
     opts: &ScanOptions,
     mut on_warning: impl FnMut(String),
-) -> Vec<(PathBuf, &'static Pattern)> {
-    let mut matches: Vec<(PathBuf, &'static Pattern)> = Vec::new();
-
+    mut on_match: impl FnMut(PathBuf, &'static Pattern),
+) {
     let mut walker = WalkDir::new(root)
         .follow_links(opts.follow_symlinks)
         .into_iter();
@@ -226,14 +227,27 @@ fn collect_matches(
 
         if entry.file_type().is_dir() {
             if let Some(pattern) = entry.file_name().to_str().and_then(match_pattern) {
-                matches.push((entry.path().to_path_buf(), pattern));
+                on_match(entry.path().to_path_buf(), pattern);
                 // Don't descend into a matched directory: we size it whole and
                 // avoid double-counting nested dependency directories.
                 walker.skip_current_dir();
             }
         }
     }
+}
 
+/// Collect the paths of every dependency directory beneath `root` into a `Vec`.
+/// Thin wrapper over [`walk_matches`] for the batch code paths that need the
+/// full list up front.
+fn collect_matches(
+    root: &Path,
+    opts: &ScanOptions,
+    on_warning: impl FnMut(String),
+) -> Vec<(PathBuf, &'static Pattern)> {
+    let mut matches: Vec<(PathBuf, &'static Pattern)> = Vec::new();
+    walk_matches(root, opts, on_warning, |path, pattern| {
+        matches.push((path, pattern));
+    });
     matches
 }
 
@@ -253,30 +267,37 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
     results
 }
 
-/// Streaming variant of [`scan`]. Discovers matches, then sizes them in
-/// parallel, sending a [`ScanEvent`] over `tx` as each step happens. Returns
-/// when every match has been sized (or `tx` has hung up). Designed to run on a
-/// background thread feeding a live UI.
+/// Streaming variant of [`scan`]. Emits a `Discovered` event and kicks off
+/// sizing for each match *as the walk finds it*, so results begin flowing to the
+/// UI without waiting for the whole tree to be traversed. Sizing runs in
+/// parallel on the rayon pool; each finished directory produces a `Sized` event.
+/// Returns once the walk is done and every match has been sized (or `tx` has
+/// hung up). Designed to run on a background thread feeding a live UI.
 pub fn scan_streaming(root: &Path, opts: &ScanOptions, tx: Sender<ScanEvent>) {
-    let warn_tx = tx.clone();
-    let matches = collect_matches(root, opts, |w| {
-        let _ = warn_tx.send(ScanEvent::Warning(w));
-    });
-
-    for (path, pattern) in &matches {
-        let _ = tx.send(ScanEvent::Discovered {
-            path: path.clone(),
-            ecosystem: pattern.ecosystem,
-        });
-    }
-
     let follow = opts.follow_symlinks;
-    matches
-        .into_par_iter()
-        .for_each_with(tx, |tx, (path, pattern)| {
-            let dir = size_match(path, pattern, follow);
-            let _ = tx.send(ScanEvent::Sized(dir));
-        });
+
+    // The walk runs on this thread while sizing tasks are spawned onto the rayon
+    // pool. The scope waits for all sizing tasks before returning.
+    rayon::scope(|scope| {
+        walk_matches(
+            root,
+            opts,
+            |w| {
+                let _ = tx.send(ScanEvent::Warning(w));
+            },
+            |path, pattern| {
+                let _ = tx.send(ScanEvent::Discovered {
+                    path: path.clone(),
+                    ecosystem: pattern.ecosystem,
+                });
+                let tx = tx.clone();
+                scope.spawn(move |_| {
+                    let dir = size_match(path, pattern, follow);
+                    let _ = tx.send(ScanEvent::Sized(dir));
+                });
+            },
+        );
+    });
 }
 
 /// Size a single matched directory into a [`DependencyDir`].
