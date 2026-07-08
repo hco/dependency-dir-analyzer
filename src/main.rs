@@ -46,11 +46,7 @@ fn main() -> Result<()> {
     let interactive = args.format == Format::Table && !args.plain && io::stdout().is_terminal();
 
     if interactive {
-        let results =
-            tui::run(&args.path, opts, args.top, min_size).context("interactive UI failed")?;
-        // Leave a static summary in the scrollback after the alt-screen UI exits.
-        let report = Report::new(&root, &results);
-        report::print_table(&report, !args.no_summary)?;
+        tui::run(&args.path, opts, args.top, min_size).context("interactive UI failed")?;
         return Ok(());
     }
 
