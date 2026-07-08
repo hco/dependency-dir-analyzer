@@ -42,6 +42,33 @@ impl SortKey {
     }
 }
 
+/// How the size column renders byte counts. Toggled with `u` in the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SizeUnit {
+    /// Whole megabytes with thousands separators (e.g. `12,300 MB`) — the
+    /// default, so the column is directly comparable at a glance.
+    #[default]
+    Megabytes,
+    /// Adaptive `humansize` rendering (e.g. `12.30 GB`, `1.53 MB`, `512 B`).
+    Human,
+}
+
+impl SizeUnit {
+    pub fn toggle(self) -> Self {
+        match self {
+            SizeUnit::Megabytes => SizeUnit::Human,
+            SizeUnit::Human => SizeUnit::Megabytes,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SizeUnit::Megabytes => "MB",
+            SizeUnit::Human => "auto",
+        }
+    }
+}
+
 /// Minimum-size threshold cycler applied on top of the CLI `--min-size`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SizeFilter {
@@ -148,6 +175,7 @@ pub struct ViewState {
     pub age_filter: AgeFilter,
     pub disabled_ecos: HashSet<String>,
     pub collapsed_ecos: HashSet<String>,
+    pub size_unit: SizeUnit,
 }
 
 /// Load the saved view state for `root`, or defaults if none is stored.

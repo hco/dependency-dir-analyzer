@@ -36,6 +36,29 @@ pub fn human_size(bytes: u64) -> String {
     format_size(bytes, DECIMAL)
 }
 
+/// Render a size as whole (decimal) megabytes with thousands separators, e.g.
+/// `12,300 MB`. Rounds to the nearest megabyte, so the column stays directly
+/// comparable without decimal noise.
+pub fn megabytes_size(bytes: u64) -> String {
+    let mb = (bytes as f64 / 1_000_000.0).round() as u64;
+    format!("{} MB", group_thousands(mb))
+}
+
+/// Format an integer with `,` grouping every three digits (e.g. `1,234,567`).
+pub fn group_thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + len / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        if i != 0 && (len - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(b as char);
+    }
+    out
+}
+
 /// Render a modification time as a short, human-friendly relative age such as
 /// `3d ago`, `5mo ago` or `just now`, measured against [`SystemTime::now`].
 /// Returns `"—"` when the timestamp is unknown.
@@ -307,6 +330,25 @@ mod tests {
         // The directory with no timestamp leaves the two trailing time columns
         // empty.
         assert!(out.contains("500000,4,,"));
+    }
+
+    #[test]
+    fn thousands_are_grouped() {
+        assert_eq!(group_thousands(0), "0");
+        assert_eq!(group_thousands(42), "42");
+        assert_eq!(group_thousands(1_234), "1,234");
+        assert_eq!(group_thousands(12_345), "12,345");
+        assert_eq!(group_thousands(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn megabytes_round_and_group() {
+        assert_eq!(megabytes_size(0), "0 MB");
+        assert_eq!(megabytes_size(512), "0 MB");
+        assert_eq!(megabytes_size(2_000_000), "2 MB");
+        // 1.53 MB rounds up to 2 MB — no decimals in this mode.
+        assert_eq!(megabytes_size(1_530_000), "2 MB");
+        assert_eq!(megabytes_size(12_300_000_000), "12,300 MB");
     }
 
     #[test]

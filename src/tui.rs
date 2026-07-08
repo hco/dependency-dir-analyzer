@@ -22,9 +22,9 @@ use ratatui::widgets::{
 };
 use ratatui::DefaultTerminal;
 
-use crate::report::{human_size, relative_age};
+use crate::report::{group_thousands, human_size, megabytes_size, relative_age};
 use crate::scanner::{self, DependencyDir, ScanEvent, ScanOptions};
-use crate::state::{self, AgeFilter, SizeFilter, SortKey, ViewState};
+use crate::state::{self, AgeFilter, SizeFilter, SizeUnit, SortKey, ViewState};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Redraw cadence while something is animating (the scan or a deletion is
@@ -155,6 +155,8 @@ struct App {
     group: bool,
     size_filter: SizeFilter,
     age_filter: AgeFilter,
+    /// How the size column renders byte counts (whole MB vs adaptive humansize).
+    size_unit: SizeUnit,
     /// Ecosystems the user has toggled *off* in the ecosystem panel. Empty means
     /// every ecosystem is shown. Stored by label so it survives across restarts.
     disabled_ecos: HashSet<String>,
@@ -191,6 +193,7 @@ impl App {
             group: view.group,
             size_filter: view.size_filter,
             age_filter: view.age_filter,
+            size_unit: view.size_unit,
             disabled_ecos: view.disabled_ecos,
             collapsed_ecos: view.collapsed_ecos,
             selected: HashSet::new(),
@@ -212,6 +215,7 @@ impl App {
             group: self.group,
             size_filter: self.size_filter,
             age_filter: self.age_filter,
+            size_unit: self.size_unit,
             disabled_ecos: self.disabled_ecos.clone(),
             collapsed_ecos: self.collapsed_ecos.clone(),
         }
@@ -350,6 +354,7 @@ impl App {
             KeyCode::Char('c') => self.clear_selection(),
             KeyCode::Char('d') | KeyCode::Delete => self.open_confirm_delete(),
             KeyCode::Char('s') => self.sort = self.sort.next(),
+            KeyCode::Char('u') => self.size_unit = self.size_unit.toggle(),
             KeyCode::Char('g') => self.group = !self.group,
             KeyCode::Char('f') => self.size_filter = self.size_filter.next(),
             KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
@@ -666,13 +671,13 @@ impl App {
             format!(
                 "{verb} {ok} director{} · reclaimed {}",
                 if ok == 1 { "y" } else { "ies" },
-                human_size(p.reclaimed)
+                self.fmt_size(p.reclaimed)
             )
         } else {
             format!(
                 "{verb} {ok}, {} failed · reclaimed {} · see ⚠",
                 p.failures,
-                human_size(p.reclaimed)
+                self.fmt_size(p.reclaimed)
             )
         });
     }
@@ -892,7 +897,7 @@ impl App {
             Line::from(vec![
                 Span::styled("Reclaimed so far: ", Style::new().fg(Color::Gray)),
                 Span::styled(
-                    human_size(p.reclaimed),
+                    self.fmt_size(p.reclaimed),
                     Style::new().fg(Color::Green).bold(),
                 ),
             ]),
@@ -1004,7 +1009,7 @@ impl App {
 
         // Bar column width derives from the available area (the leading
         // checkbox column and its spacing take a few more cells than before).
-        let bar_width = (area.width as usize).saturating_sub(67).clamp(6, 24);
+        let bar_width = (area.width as usize).saturating_sub(71).clamp(6, 24);
 
         // Collect into an owned Vec so the immutable borrow of `self`/`items`
         // ends before the table is rendered with `&mut self.state` below.
@@ -1015,9 +1020,9 @@ impl App {
 
         let header = TableRow::new(vec![
             Cell::from(""),
-            Cell::from("Size"),
+            Cell::from(Text::from("Size").right_aligned()),
             Cell::from(""),
-            Cell::from("Files"),
+            Cell::from(Text::from("Files").right_aligned()),
             Cell::from("Modified"),
             Cell::from("Ecosystem"),
             Cell::from("Path"),
@@ -1026,9 +1031,9 @@ impl App {
 
         let widths = [
             Constraint::Length(1),
-            Constraint::Length(10),
+            Constraint::Length(12),
             Constraint::Length(bar_width as u16),
-            Constraint::Length(8),
+            Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(16),
             Constraint::Min(20),
@@ -1074,10 +1079,14 @@ impl App {
                 };
                 TableRow::new(vec![
                     Cell::from(mark).style(mark_style),
-                    Cell::from(human_size(*total)).style(Style::new().fg(Color::White).bold()),
+                    Cell::from(Text::from(self.fmt_size(*total)).right_aligned())
+                        .style(Style::new().fg(Color::White).bold()),
                     Cell::from(""),
-                    Cell::from(format!("{count} dir{}", if *count == 1 { "" } else { "s" }))
-                        .style(Style::new().fg(Color::Gray)),
+                    Cell::from(
+                        Text::from(format!("{count} dir{}", if *count == 1 { "" } else { "s" }))
+                            .right_aligned(),
+                    )
+                    .style(Style::new().fg(Color::Gray)),
                     Cell::from(""),
                     Cell::from(format!("{glyph} {ecosystem}"))
                         .style(Style::new().fg(Color::Cyan).bold()),
@@ -1097,9 +1106,11 @@ impl App {
                 let mark = if marked { "✓" } else { " " };
                 let row = TableRow::new(vec![
                     Cell::from(mark).style(Style::new().fg(SELECT_FG).bold()),
-                    Cell::from(human_size(d.size_bytes)).style(Style::new().fg(color).bold()),
+                    Cell::from(Text::from(self.fmt_size(d.size_bytes)).right_aligned())
+                        .style(Style::new().fg(color).bold()),
                     Cell::from(build_bar(frac, bar_width)).style(Style::new().fg(color)),
-                    Cell::from(d.file_count.to_string()).style(Style::new().fg(Color::Gray)),
+                    Cell::from(Text::from(group_thousands(d.file_count)).right_aligned())
+                        .style(Style::new().fg(Color::Gray)),
                     Cell::from(relative_age(d.modified))
                         .style(Style::new().fg(age_color(d.modified))),
                     Cell::from(d.ecosystem).style(Style::new().fg(Color::Cyan)),
@@ -1118,7 +1129,7 @@ impl App {
                 Cell::from(format!("{} sizing…", SPINNER[self.spinner]))
                     .style(Style::new().fg(Color::DarkGray)),
                 Cell::from(build_bar(0.0, bar_width)),
-                Cell::from("—").style(Style::new().fg(Color::DarkGray)),
+                Cell::from(Text::from("—").right_aligned()).style(Style::new().fg(Color::DarkGray)),
                 Cell::from("—").style(Style::new().fg(Color::DarkGray)),
                 Cell::from(*ecosystem).style(Style::new().fg(Color::DarkGray)),
                 Cell::from(self.display_path(path)).style(Style::new().fg(Color::DarkGray)),
@@ -1159,13 +1170,13 @@ impl App {
         // after the reclaimable-space total.
         let (sel_count, sel_bytes) = self.selected_total();
         let mut chips = vec![Span::styled(
-            format!(" {} ", human_size(total)),
+            format!(" {} ", self.fmt_size(total)),
             Style::new().bg(Color::Green).fg(Color::Black).bold(),
         )];
         if sel_count > 0 {
             chips.push(Span::raw(" "));
             chips.push(Span::styled(
-                format!(" ✗ {sel_count} marked · {} ", human_size(sel_bytes)),
+                format!(" ✗ {sel_count} marked · {} ", self.fmt_size(sel_bytes)),
                 Style::new().bg(Color::Red).fg(Color::White).bold(),
             ));
         }
@@ -1188,6 +1199,11 @@ impl App {
                 } else {
                     Color::DarkGray
                 }),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("unit:{}", self.size_unit.label()),
+                Style::new().fg(Color::Blue),
             ),
         ]);
         chips.push(Span::raw("  "));
@@ -1230,7 +1246,7 @@ impl App {
         // (which the footer chip already advertises with "press d to delete")
         // below.
         let hints_view = Line::from(vec![Span::styled(
-            "↑/↓ move   s sort   g group   ↵ fold   f size   a age   e ecosystem   r reset",
+            "↑/↓ move   s sort   g group   u unit   ↵ fold   f size   a age   e ecosystem   r reset",
             Style::new().fg(Color::DarkGray),
         )]);
         let delete_hint = if sel_count > 0 {
@@ -1263,6 +1279,7 @@ impl App {
             help_line("Home / End", "first / last row"),
             Line::raw(""),
             help_line("s", "cycle sort (size · modified · name · files)"),
+            help_line("u", "toggle size units (MB · auto)"),
             help_line("g", "toggle grouping by ecosystem"),
             help_line("Enter / Space", "fold/unfold selected group"),
             help_line("f", "cycle minimum-size filter"),
@@ -1388,7 +1405,7 @@ impl App {
         for (path, size) in dirs.iter().take(MAX_LISTED) {
             lines.push(Line::from(vec![
                 Span::styled(
-                    format!("  {:>9}  ", human_size(*size)),
+                    format!("  {:>9}  ", self.fmt_size(*size)),
                     Style::new().fg(Color::Gray),
                 ),
                 Span::styled(self.display_path(path), Style::new().fg(Color::White)),
@@ -1404,7 +1421,7 @@ impl App {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
             Span::styled("Reclaims ", Style::new().fg(Color::Gray)),
-            Span::styled(human_size(bytes), Style::new().fg(Color::Green).bold()),
+            Span::styled(self.fmt_size(bytes), Style::new().fg(Color::Green).bold()),
             Span::styled(" of disk space.", Style::new().fg(Color::Gray)),
         ]));
         lines.push(Line::raw(""));
@@ -1466,6 +1483,14 @@ impl App {
                 .style(Style::new().bg(Color::Rgb(24, 18, 22))),
         );
         frame.render_widget(para, area);
+    }
+
+    /// Render a byte count for the size column, honouring the current unit mode.
+    fn fmt_size(&self, bytes: u64) -> String {
+        match self.size_unit {
+            SizeUnit::Megabytes => megabytes_size(bytes),
+            SizeUnit::Human => human_size(bytes),
+        }
     }
 
     /// Display a path relative to the scan root when possible, so the table
