@@ -9,7 +9,11 @@ was last touched.
 Great for answering "where did all my disk space go?" and for finding
 reclaimable space across a folder full of projects.
 
-The binary is called **`dda`**.
+The binary is called **`dda`**. Install it with Homebrew:
+
+```bash
+brew install hco/tap/dda
+```
 
 ![dda scanning a project tree, marking directories, and confirming a trash-it deletion](demo/demo.gif)
 
