@@ -46,7 +46,8 @@ fn main() -> Result<()> {
     let interactive = args.format == Format::Table && !args.plain && io::stdout().is_terminal();
 
     if interactive {
-        tui::run(&args.path, opts, args.top, min_size, args.icons)
+        let mouse = resolve_mouse(args.no_mouse);
+        tui::run(&args.path, opts, args.top, min_size, args.icons, mouse)
             .context("interactive UI failed")?;
         return Ok(());
     }
@@ -70,6 +71,34 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Decide whether the interactive UI should capture the mouse, honouring — in
+/// priority order — the `--no-mouse` flag, the `DDA_NO_MOUSE` environment
+/// variable, then the persisted `mouse` config setting (default: enabled).
+fn resolve_mouse(no_mouse_flag: bool) -> bool {
+    if no_mouse_flag {
+        return false;
+    }
+    // The env var names the "no mouse" intent: truthy disables, falsy forces it
+    // back on (overriding a config that turned it off); anything else defers.
+    if let Some(no_mouse) = std::env::var("DDA_NO_MOUSE")
+        .ok()
+        .and_then(|raw| parse_env_bool(&raw))
+    {
+        return !no_mouse;
+    }
+    crate::state::settings().mouse
+}
+
+/// Parse a boolean-ish environment variable value, returning `None` for unset,
+/// empty or unrecognised input so the caller can fall through to the next layer.
+fn parse_env_bool(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Print a shell completion script for `shell` to stdout.
 ///
 /// The script is generated into a buffer first and then written out, so a
@@ -86,5 +115,30 @@ fn print_completions(shell: Shell) {
         if e.kind() != io::ErrorKind::BrokenPipe {
             eprintln!("error writing completions: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_bool_recognises_common_spellings() {
+        for on in ["1", "true", "TRUE", "yes", "on", " On "] {
+            assert_eq!(parse_env_bool(on), Some(true), "{on:?}");
+        }
+        for off in ["0", "false", "no", "off"] {
+            assert_eq!(parse_env_bool(off), Some(false), "{off:?}");
+        }
+        // Unset/empty/garbage defers to the next layer.
+        for other in ["", "maybe", "2"] {
+            assert_eq!(parse_env_bool(other), None, "{other:?}");
+        }
+    }
+
+    #[test]
+    fn no_mouse_flag_beats_everything() {
+        // The flag short-circuits before the env var or config are consulted.
+        assert!(!resolve_mouse(true));
     }
 }

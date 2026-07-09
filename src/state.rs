@@ -256,6 +256,38 @@ impl AgeFilter {
     }
 }
 
+/// Global preferences that apply to every scan, independent of the scan root.
+///
+/// Kept separate from the per-root [`ViewState`] because they are machine-wide
+/// choices, not per-directory ones.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Whether the interactive UI captures the mouse. This is the config layer
+    /// of the mouse opt-out; the `--no-mouse` flag and `DDA_NO_MOUSE`
+    /// environment variable override it at runtime.
+    pub mouse: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        // Mouse capture is on by default; disabling it is opt-in.
+        Settings { mouse: true }
+    }
+}
+
+/// The on-disk store: global [`Settings`] plus the per-root [`ViewState`] map.
+///
+/// `deny_unknown_fields` lets [`load_store`] tell this apart from the legacy
+/// format (a bare path→`ViewState` map), whose path keys are rejected here so
+/// the loader can fall back and migrate them.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct Store {
+    settings: Settings,
+    roots: HashMap<String, ViewState>,
+}
+
 /// The persisted, restorable view preferences for one scan root.
 ///
 /// Ecosystems are stored by their string label; on load these are matched
@@ -277,32 +309,49 @@ pub struct ViewState {
 /// Load the saved view state for `root`, or defaults if none is stored.
 pub fn load(root: &Path) -> ViewState {
     let key = key_for(root);
-    load_all().remove(&key).unwrap_or_default()
+    load_store().roots.remove(&key).unwrap_or_default()
 }
 
-/// Persist `state` for `root`, leaving every other directory's entry untouched.
-/// Errors are intentionally swallowed — this is a best-effort convenience.
+/// Load the global settings, or defaults if none are stored.
+pub fn settings() -> Settings {
+    load_store().settings
+}
+
+/// Persist `state` for `root`, leaving every other directory's entry (and the
+/// global settings) untouched. Errors are intentionally swallowed — this is a
+/// best-effort convenience.
 pub fn save(root: &Path, state: &ViewState) {
     let Some(path) = store_path() else {
         return;
     };
-    let mut all = load_all();
-    all.insert(key_for(root), state.clone());
+    let mut store = load_store();
+    store.roots.insert(key_for(root), state.clone());
 
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_vec_pretty(&all) {
+    if let Ok(json) = serde_json::to_vec_pretty(&store) {
         let _ = std::fs::write(&path, json);
     }
 }
 
-/// Read the whole directory→state map, or an empty map if it can't be read.
-fn load_all() -> HashMap<String, ViewState> {
-    store_path()
-        .and_then(|p| std::fs::read(p).ok())
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+/// Read the whole store, or defaults if it can't be read. A file written by an
+/// older version (a bare path→[`ViewState`] map, with no global settings) is
+/// migrated in place so existing per-root preferences survive the upgrade.
+fn load_store() -> Store {
+    let Some(bytes) = store_path().and_then(|p| std::fs::read(p).ok()) else {
+        return Store::default();
+    };
+    if let Ok(store) = serde_json::from_slice::<Store>(&bytes) {
+        return store;
+    }
+    if let Ok(roots) = serde_json::from_slice::<HashMap<String, ViewState>>(&bytes) {
+        return Store {
+            settings: Settings::default(),
+            roots,
+        };
+    }
+    Store::default()
 }
 
 /// A stable key for a scan root: its canonical absolute path when resolvable,
@@ -389,6 +438,41 @@ mod tests {
         assert_eq!(back.age_filter, AgeFilter::Month1);
         assert!(back.disabled_ecos.contains("Node.js"));
         assert!(back.collapsed_ecos.contains("Rust / Maven"));
+    }
+
+    #[test]
+    fn settings_default_to_mouse_on() {
+        assert!(Settings::default().mouse);
+        // A stored settings object round-trips its value.
+        let json = serde_json::to_vec(&Settings { mouse: false }).unwrap();
+        let back: Settings = serde_json::from_slice(&json).unwrap();
+        assert!(!back.mouse);
+        // A partial/empty object falls back to the mouse-on default.
+        let back: Settings = serde_json::from_str("{}").unwrap();
+        assert!(back.mouse);
+    }
+
+    #[test]
+    fn store_is_distinguishable_from_the_legacy_map() {
+        // The current format parses as a Store.
+        let mut roots = HashMap::new();
+        roots.insert("/tmp/foo".to_string(), ViewState::default());
+        let store = Store {
+            settings: Settings { mouse: false },
+            roots,
+        };
+        let json = serde_json::to_vec(&store).unwrap();
+        let back: Store = serde_json::from_slice(&json).unwrap();
+        assert!(!back.settings.mouse);
+        assert!(back.roots.contains_key("/tmp/foo"));
+
+        // A legacy bare map is rejected by the strict Store parse (its path keys
+        // are unknown fields)...
+        let legacy = br#"{"/tmp/foo":{"group":true}}"#;
+        assert!(serde_json::from_slice::<Store>(legacy).is_err());
+        // ...but still deserializes as the old map, which `load_store` migrates.
+        let roots: HashMap<String, ViewState> = serde_json::from_slice(legacy).unwrap();
+        assert!(roots["/tmp/foo"].group);
     }
 
     #[test]

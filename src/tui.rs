@@ -7,6 +7,11 @@
 //! filter, mark directories for deletion, and quit; on exit the final
 //! largest-first results (minus anything deleted) are returned so the caller can
 //! leave a static summary in the terminal scrollback.
+//!
+//! The UI is mouse-aware as well as keyboard-driven: the scroll wheel moves the
+//! selection, a left click highlights the row under the cursor, and the header
+//! filter chips, footer status chips and overlay controls are all clickable,
+//! each bound to the same action as its keyboard shortcut.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -17,7 +22,12 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::execute;
+use ratatui::layout::Position;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState, Wrap,
@@ -38,6 +48,10 @@ const TICK: Duration = Duration::from_millis(100);
 /// key press wakes it sooner.
 const IDLE_TICK: Duration = Duration::from_secs(3600);
 
+/// How many rows one scroll-wheel notch moves the selection, matching the
+/// conventional "three lines per notch" of most terminals.
+const SCROLL_STEP: isize = 3;
+
 /// Foreground/background accents for directories marked for deletion.
 const SELECT_FG: Color = Color::Rgb(255, 120, 120);
 const SELECT_BG: Color = Color::Rgb(60, 28, 34);
@@ -51,6 +65,7 @@ pub fn run(
     top: usize,
     min_size: u64,
     icons: Option<IconStyle>,
+    mouse: bool,
 ) -> Result<Vec<DependencyDir>> {
     let (tx, rx) = mpsc::channel();
     let root_buf = root.to_path_buf();
@@ -70,8 +85,21 @@ pub fn run(
     }
 
     let mut terminal = ratatui::init();
+    // Capture the mouse so the UI can react to clicks and the scroll wheel,
+    // unless the user opted out. Capture takes over the mouse, suppressing the
+    // terminal's native click-drag text selection and scrollback while the TUI
+    // runs (hold Shift to bypass in most terminals) — which is exactly why
+    // `--no-mouse` / `DDA_NO_MOUSE` / the `mouse` config setting exist. Enabling
+    // is best-effort: a terminal that rejects it just stays keyboard-only.
+    if mouse {
+        let _ = execute!(std::io::stdout(), EnableMouseCapture);
+    }
     let mut app = App::new(root.to_path_buf(), top, min_size, view);
+    app.mouse_enabled = mouse;
     let result = app.event_loop(&mut terminal, rx);
+    if mouse {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    }
     ratatui::restore();
 
     // Tell an unfinished scan to stop before we wait on it, so quitting mid-scan
@@ -159,6 +187,80 @@ enum DisplayItem<'a> {
     Data(&'a Row),
 }
 
+/// A control the user can click. Regions carrying one of these are registered
+/// afresh every frame (see [`App::clicks`]) and hit-tested on a left click. Each
+/// variant mirrors a keyboard action so the two input paths stay in lock-step.
+#[derive(Clone, Copy)]
+enum ClickAction {
+    // Header filter bar.
+    CycleSize,
+    CycleAge,
+    OpenEco,
+    ResetFilters,
+    // Footer status chips.
+    CycleSort,
+    ToggleGroup,
+    CycleUnit,
+    CycleIcons,
+    // Ecosystem overlay.
+    EcoToggle(usize),
+    EcoAllNone,
+    // Confirm-delete overlay.
+    ConfirmYes,
+    ConfirmToggleMode,
+    ConfirmCancel,
+}
+
+/// A single line of styled spans that also remembers which sub-runs are
+/// clickable. Widths are tracked with [`Span::width`] as spans are appended, so
+/// callers get the exact horizontal extent of each clickable run without
+/// re-measuring the finished line. Offsets are relative to the line start; the
+/// caller translates them to screen coordinates once it knows the origin.
+#[derive(Default)]
+struct ClickLine {
+    spans: Vec<Span<'static>>,
+    /// `(start_offset, width, action)` for each clickable run, in cells.
+    regions: Vec<(u16, u16, ClickAction)>,
+    width: u16,
+}
+
+impl ClickLine {
+    /// Append non-interactive spans.
+    fn text(&mut self, span: Span<'static>) {
+        self.width += span.width() as u16;
+        self.spans.push(span);
+    }
+
+    /// Append a run of spans as one clickable target for `action`.
+    fn button(&mut self, spans: Vec<Span<'static>>, action: ClickAction) {
+        let start = self.width;
+        let w: u16 = spans.iter().map(|s| s.width() as u16).sum();
+        self.regions.push((start, w, action));
+        self.width += w;
+        self.spans.extend(spans);
+    }
+
+    /// Push this line's clickable runs into `sink`, translated so the line's
+    /// left edge sits at (`x`, `y`) on screen.
+    fn register(&self, sink: &mut Vec<(Rect, ClickAction)>, x: u16, y: u16) {
+        for &(start, w, action) in &self.regions {
+            sink.push((
+                Rect {
+                    x: x.saturating_add(start),
+                    y,
+                    width: w,
+                    height: 1,
+                },
+                action,
+            ));
+        }
+    }
+
+    fn into_line(self) -> Line<'static> {
+        Line::from(self.spans)
+    }
+}
+
 struct App {
     root: PathBuf,
     rows: Vec<Row>,
@@ -201,6 +303,18 @@ struct App {
     top: usize,
     min_size: u64,
     state: TableState,
+    /// Clickable regions registered during the most recent [`App::draw`]. A left
+    /// click is hit-tested against these (topmost/last-drawn wins by draw order,
+    /// gated by the active overlay). Rebuilt every frame.
+    clicks: Vec<(Rect, ClickAction)>,
+    /// The table's data-row area (inside the border, below the column header)
+    /// from the last draw, so a click can be mapped to a row via the current
+    /// scroll offset. `None` when the table isn't showing rows.
+    table_area: Option<Rect>,
+    /// Whether mouse capture is active this run (see [`run`]). Only affects what
+    /// the help overlay advertises — with capture off no mouse events arrive, so
+    /// the handlers are simply dormant. Defaults to `true`; [`run`] sets it.
+    mouse_enabled: bool,
 }
 
 impl App {
@@ -229,6 +343,9 @@ impl App {
             top,
             min_size,
             state: TableState::default(),
+            clicks: Vec::new(),
+            table_area: None,
+            mouse_enabled: true,
         }
     }
 
@@ -268,10 +385,16 @@ impl App {
             // An event (key press, resize, …) means the view may have changed.
             let mut dirty = false;
             if event::poll(timeout)? {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == KeyEventKind::Press && self.handle_key(key.code, key.modifiers) {
-                        return Ok(());
+                match event::read()? {
+                    Event::Key(key) => {
+                        if key.kind == KeyEventKind::Press
+                            && self.handle_key(key.code, key.modifiers)
+                        {
+                            return Ok(());
+                        }
                     }
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
+                    _ => {}
                 }
                 dirty = true;
             }
@@ -452,6 +575,157 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Dispatch a mouse event. Scroll moves the selection (or the ecosystem
+    /// cursor when that panel is open); a left click is hit-tested against the
+    /// regions registered on the last frame.
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Mirror the keyboard rule: while a deletion runs the UI is read-only.
+        if self.delete_progress.is_some() {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::ScrollDown => self.scroll(1),
+            MouseEventKind::ScrollUp => self.scroll(-1),
+            MouseEventKind::Down(MouseButton::Left) => self.handle_click(mouse.column, mouse.row),
+            _ => {}
+        }
+    }
+
+    /// A scroll-wheel notch: move the ecosystem-panel cursor by one when it is
+    /// open, otherwise move the table selection by [`SCROLL_STEP`] rows.
+    fn scroll(&mut self, delta: isize) {
+        if matches!(self.overlay, Overlay::Ecosystems { .. }) {
+            let len = self.ecosystems_present().len();
+            if let Overlay::Ecosystems { cursor } = &mut self.overlay {
+                if len > 0 {
+                    *cursor = (*cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+                }
+            }
+        } else if matches!(self.overlay, Overlay::None) {
+            self.move_selection(delta * SCROLL_STEP);
+        }
+    }
+
+    /// Handle a left click at (`col`, `row`). Help dismisses on any click;
+    /// otherwise the first registered region that both contains the point and is
+    /// valid for the current overlay wins, and failing that a click inside the
+    /// table selects the row under the cursor.
+    fn handle_click(&mut self, col: u16, row: u16) {
+        if let Overlay::Help = self.overlay {
+            self.overlay = Overlay::None;
+            return;
+        }
+        let point = Position { x: col, y: row };
+        // Only consider regions allowed in the current mode, so chrome drawn
+        // behind an open overlay isn't triggered through the modal.
+        let hit = self
+            .clicks
+            .iter()
+            .find(|(rect, action)| rect.contains(point) && self.action_allowed(*action))
+            .map(|(_, action)| *action);
+        if let Some(action) = hit {
+            self.apply_click_action(action);
+            return;
+        }
+        // No chrome hit: in the main view, a click in the table highlights the
+        // row under the cursor.
+        if matches!(self.overlay, Overlay::None) {
+            if let Some(index) = self.row_at(col, row) {
+                self.state.select(Some(index));
+            }
+        }
+    }
+
+    /// Whether `action` may fire given the overlay currently on top.
+    fn action_allowed(&self, action: ClickAction) -> bool {
+        use ClickAction::*;
+        match self.overlay {
+            Overlay::None => matches!(
+                action,
+                CycleSize
+                    | CycleAge
+                    | OpenEco
+                    | ResetFilters
+                    | CycleSort
+                    | ToggleGroup
+                    | CycleUnit
+                    | CycleIcons
+            ),
+            Overlay::Ecosystems { .. } => matches!(action, EcoToggle(_) | EcoAllNone),
+            Overlay::ConfirmDelete { .. } => {
+                matches!(action, ConfirmYes | ConfirmToggleMode | ConfirmCancel)
+            }
+            Overlay::Help => false,
+        }
+    }
+
+    /// Perform the action bound to a clicked control.
+    fn apply_click_action(&mut self, action: ClickAction) {
+        match action {
+            ClickAction::CycleSize => self.size_filter = self.size_filter.next(),
+            ClickAction::CycleAge => self.age_filter = self.age_filter.next(),
+            ClickAction::OpenEco => self.overlay = Overlay::Ecosystems { cursor: 0 },
+            ClickAction::ResetFilters => self.reset_filters(),
+            ClickAction::CycleSort => self.sort = self.sort.next(),
+            ClickAction::ToggleGroup => self.group = !self.group,
+            ClickAction::CycleUnit => self.size_unit = self.size_unit.toggle(),
+            ClickAction::CycleIcons => self.icon_style = self.icon_style.cycle(),
+            ClickAction::EcoToggle(i) => self.toggle_eco_at(i),
+            ClickAction::EcoAllNone => self.toggle_all_ecos(),
+            ClickAction::ConfirmYes => {
+                if let Overlay::ConfirmDelete { permanent } = self.overlay {
+                    self.overlay = Overlay::None;
+                    self.start_deletion(permanent);
+                }
+            }
+            ClickAction::ConfirmToggleMode => {
+                if let Overlay::ConfirmDelete { permanent } = self.overlay {
+                    self.overlay = Overlay::ConfirmDelete {
+                        permanent: !permanent,
+                    };
+                }
+            }
+            ClickAction::ConfirmCancel => self.overlay = Overlay::None,
+        }
+    }
+
+    /// Toggle the ecosystem at index `i` (as listed in the panel) and move the
+    /// keyboard cursor to it, so mouse and keyboard stay in sync.
+    fn toggle_eco_at(&mut self, i: usize) {
+        let ecos = self.ecosystems_present();
+        if let Some(&eco) = ecos.get(i) {
+            if !self.disabled_ecos.remove(eco) {
+                self.disabled_ecos.insert(eco.to_string());
+            }
+            if let Overlay::Ecosystems { cursor } = &mut self.overlay {
+                *cursor = i;
+            }
+        }
+    }
+
+    /// Enable every ecosystem if any is disabled, otherwise disable them all —
+    /// the mouse equivalent of `a` in the ecosystem panel.
+    fn toggle_all_ecos(&mut self) {
+        let ecos = self.ecosystems_present();
+        if self.disabled_ecos.is_empty() {
+            self.disabled_ecos
+                .extend(ecos.iter().map(|e| e.to_string()));
+        } else {
+            self.disabled_ecos.clear();
+        }
+    }
+
+    /// The display-item index under a click at (`col`, `row`), or `None` if the
+    /// point is outside the table's data-row area or past the last row.
+    fn row_at(&self, col: u16, row: u16) -> Option<usize> {
+        let area = self.table_area?;
+        if !area.contains(Position { x: col, y: row }) {
+            return None;
+        }
+        let index = self.state.offset() + (row - area.y) as usize;
+        (index < self.visible_len()).then_some(index)
     }
 
     fn reset_filters(&mut self) {
@@ -884,6 +1158,11 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        // Clickable regions are rebuilt from scratch each frame so they always
+        // reflect what is actually on screen right now.
+        self.clicks.clear();
+        self.table_area = None;
+
         let chunks = Layout::vertical([
             Constraint::Length(4),
             Constraint::Min(1),
@@ -965,7 +1244,7 @@ impl App {
         frame.render_widget(para, area);
     }
 
-    fn draw_header(&self, frame: &mut Frame, area: Rect) {
+    fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
         let status = if self.scanning {
             format!(" {} scanning", SPINNER[self.spinner])
         } else {
@@ -991,7 +1270,11 @@ impl App {
                 }),
             ),
         ]);
-        let text = Text::from(vec![title, self.filter_line()]);
+        // The filter bar is the second inner line: below the top border and the
+        // title line, inset one cell from the left border.
+        let filters = self.filter_click_line();
+        filters.register(&mut self.clicks, area.x + 1, area.y + 2);
+        let text = Text::from(vec![title, filters.into_line()]);
         let para = Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1002,10 +1285,11 @@ impl App {
     }
 
     /// The filter bar shown as the second header line: each row filter labelled
-    /// with its keyboard shortcut, so `f`/`a`/`e` (and `r` to reset) are visible
+    /// with its keyboard shortcut, so `s`/`a`/`e` (and `r` to reset) are visible
     /// without opening help. Active filters are highlighted; the reset hint lights
-    /// up only when there is something to reset.
-    fn filter_line(&self) -> Line<'static> {
+    /// up only when there is something to reset. Each chip is also a click target
+    /// bound to the same action as its key.
+    fn filter_click_line(&self) -> ClickLine {
         let eco_active = !self.disabled_ecos.is_empty();
         let eco_value = if eco_active {
             format!("{} hidden", self.disabled_ecos.len())
@@ -1013,45 +1297,60 @@ impl App {
             "all".to_string()
         };
 
-        let mut spans = vec![Span::styled(
+        let mut line = ClickLine::default();
+        line.text(Span::styled(
             "Filters:   ",
             Style::new().fg(Color::Gray).bold(),
-        )];
-        spans.extend(top_filter_chip(
-            "s",
-            "size",
-            self.size_filter.label(),
-            self.size_filter != SizeFilter::All,
         ));
-        spans.push(Span::raw("  "));
-        spans.extend(top_filter_chip(
-            "a",
-            "age",
-            self.age_filter.label(),
-            self.age_filter != AgeFilter::Any,
-        ));
-        spans.push(Span::raw("  "));
-        spans.extend(top_filter_chip("e", "eco", &eco_value, eco_active));
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(
-            "[r]",
-            Style::new()
-                .fg(if self.has_filters() {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                })
-                .bold(),
-        ));
-        spans.push(Span::styled(
-            " reset",
-            Style::new().fg(if self.has_filters() {
-                Color::Gray
-            } else {
-                Color::DarkGray
-            }),
-        ));
-        Line::from(spans)
+        line.button(
+            top_filter_chip(
+                "s",
+                "size",
+                self.size_filter.label(),
+                self.size_filter != SizeFilter::All,
+            ),
+            ClickAction::CycleSize,
+        );
+        line.text(Span::raw("  "));
+        line.button(
+            top_filter_chip(
+                "a",
+                "age",
+                self.age_filter.label(),
+                self.age_filter != AgeFilter::Any,
+            ),
+            ClickAction::CycleAge,
+        );
+        line.text(Span::raw("  "));
+        line.button(
+            top_filter_chip("e", "eco", &eco_value, eco_active),
+            ClickAction::OpenEco,
+        );
+        line.text(Span::raw("   "));
+        line.button(
+            vec![
+                Span::styled(
+                    "[r]",
+                    Style::new()
+                        .fg(if self.has_filters() {
+                            Color::Cyan
+                        } else {
+                            Color::DarkGray
+                        })
+                        .bold(),
+                ),
+                Span::styled(
+                    " reset",
+                    Style::new().fg(if self.has_filters() {
+                        Color::Gray
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+            ],
+            ClickAction::ResetFilters,
+        );
+        line
     }
 
     /// Ensure the current selection points at a valid row, snapping it back into
@@ -1157,6 +1456,17 @@ impl App {
                     .border_style(Style::new().fg(Color::DarkGray)),
             );
 
+        // Remember where the data rows live (inside the border, below the
+        // one-line column header) so a click can be mapped back to a row.
+        if area.height > 3 && area.width > 2 {
+            self.table_area = Some(Rect {
+                x: area.x + 1,
+                y: area.y + 2,
+                width: area.width - 2,
+                height: area.height - 3,
+            });
+        }
+
         frame.render_stateful_widget(table, area, &mut self.state);
         shown
     }
@@ -1251,7 +1561,7 @@ impl App {
             || !self.disabled_ecos.is_empty()
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect, shown: usize) {
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect, shown: usize) {
         let now = now();
         let sized = self
             .rows
@@ -1272,51 +1582,63 @@ impl App {
         // The deletion set gets its own prominent, attention-grabbing chip right
         // after the reclaimable-space total.
         let (sel_count, sel_bytes) = self.selected_total();
-        let mut chips = vec![Span::styled(
+        let mut chips = ClickLine::default();
+        chips.text(Span::styled(
             format!(" {} ", self.fmt_size(total)),
             Style::new().bg(Color::Green).fg(Color::Black).bold(),
-        )];
+        ));
         if sel_count > 0 {
-            chips.push(Span::raw(" "));
-            chips.push(Span::styled(
+            chips.text(Span::raw(" "));
+            chips.text(Span::styled(
                 format!(" ✗ {sel_count} marked · {} ", self.fmt_size(sel_bytes)),
                 Style::new().bg(Color::Red).fg(Color::White).bold(),
             ));
         }
-        chips.extend([
-            Span::raw("  "),
-            Span::styled(
-                format!("{shown} shown · {sized} sized · {} found", self.rows.len()),
-                Style::new().fg(Color::Gray),
-            ),
-            Span::raw("   "),
-            Span::styled(
+        chips.text(Span::raw("  "));
+        chips.text(Span::styled(
+            format!("{shown} shown · {sized} sized · {} found", self.rows.len()),
+            Style::new().fg(Color::Gray),
+        ));
+        chips.text(Span::raw("   "));
+        // sort/group/unit/icons double as click targets for their key actions.
+        chips.button(
+            vec![Span::styled(
                 format!("sort:{}", self.sort.label()),
                 Style::new().fg(Color::Magenta),
-            ),
-            Span::raw("  "),
-            Span::styled(
+            )],
+            ClickAction::CycleSort,
+        );
+        chips.text(Span::raw("  "));
+        chips.button(
+            vec![Span::styled(
                 format!("group:{}", if self.group { "eco" } else { "off" }),
                 Style::new().fg(if self.group {
                     Color::Cyan
                 } else {
                     Color::DarkGray
                 }),
-            ),
-            Span::raw("  "),
-            Span::styled(
+            )],
+            ClickAction::ToggleGroup,
+        );
+        chips.text(Span::raw("  "));
+        chips.button(
+            vec![Span::styled(
                 format!("unit:{}", self.size_unit.label()),
                 Style::new().fg(Color::Blue),
-            ),
-            Span::raw("  "),
-            Span::styled(
+            )],
+            ClickAction::CycleUnit,
+        );
+        chips.text(Span::raw("  "));
+        chips.button(
+            vec![Span::styled(
                 format!("icons:{}", self.icon_style.label()),
                 Style::new().fg(Color::Blue),
-            ),
-        ]);
+            )],
+            ClickAction::CycleIcons,
+        );
         if self.warnings > 0 {
-            chips.push(Span::raw("  "));
-            chips.push(Span::styled(
+            chips.text(Span::raw("  "));
+            chips.text(Span::styled(
                 format!("⚠ {}", self.warnings),
                 Style::new().fg(Color::Yellow),
             ));
@@ -1324,12 +1646,14 @@ impl App {
         // The transient result of the last action (e.g. a deletion) trails the
         // chips until the selection changes again.
         if let Some(msg) = &self.action {
-            chips.push(Span::raw("   "));
-            chips.push(Span::styled(
+            chips.text(Span::raw("   "));
+            chips.text(Span::styled(
                 msg.clone(),
                 Style::new().fg(Color::Green).italic(),
             ));
         }
+        // The chips are the first inner footer line (below the top border).
+        chips.register(&mut self.clicks, area.x + 1, area.y + 1);
 
         // Two hint rows: view controls on top, the selection/deletion verbs
         // (which the footer chip already advertises with "press d to delete")
@@ -1352,7 +1676,7 @@ impl App {
             Span::styled("   ? help   q quit", Style::new().fg(Color::DarkGray)),
         ]);
 
-        let text = Text::from(vec![Line::from(chips), hints_view, hints_action]);
+        let text = Text::from(vec![chips.into_line(), hints_view, hints_action]);
         let para = Paragraph::new(text).block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1385,6 +1709,14 @@ impl App {
             help_line("?", "toggle this help"),
             help_line("q / Esc", "quit"),
             Line::raw(""),
+            if self.mouse_enabled {
+                help_line(
+                    "mouse",
+                    "scroll to move · click a row · click filters/chips",
+                )
+            } else {
+                help_line("mouse", "off (--no-mouse / DDA_NO_MOUSE / config)")
+            },
             Line::from(Span::styled(
                 "Modified colour: green = recent · red = old",
                 Style::new().fg(Color::DarkGray).italic(),
@@ -1406,7 +1738,7 @@ impl App {
         frame.render_widget(para, area);
     }
 
-    fn draw_eco_panel(&self, frame: &mut Frame, cursor: usize) {
+    fn draw_eco_panel(&mut self, frame: &mut Frame, cursor: usize) {
         let ecos = self.ecosystems_present();
 
         let lines: Vec<Line> = if ecos.is_empty() {
@@ -1452,12 +1784,37 @@ impl App {
 
         let mut content = lines;
         content.push(Line::raw(""));
-        content.push(Line::from(Span::styled(
-            "space toggle · a all/none · Esc close",
-            Style::new().fg(Color::DarkGray).italic(),
-        )));
 
-        let area = centered_rect(frame.area(), 46, content.len() as u16 + 2);
+        // Build the hint line as a click line so "a all/none" is a target.
+        let dim = Style::new().fg(Color::DarkGray).italic();
+        let mut hint = ClickLine::default();
+        hint.text(Span::styled("space toggle · ", dim));
+        hint.button(
+            vec![Span::styled("a all/none", dim)],
+            ClickAction::EcoAllNone,
+        );
+        hint.text(Span::styled(" · Esc close", dim));
+
+        let hint_index = content.len();
+        let total_lines = content.len() + 1;
+        let area = centered_rect(frame.area(), 46, total_lines as u16 + 2);
+
+        // Each ecosystem row toggles that ecosystem on click; the hint's
+        // all/none run toggles them all. Rows sit directly below the top border.
+        for i in 0..ecos.len() {
+            self.clicks.push((
+                Rect {
+                    x: area.x + 1,
+                    y: area.y + 1 + i as u16,
+                    width: area.width.saturating_sub(2),
+                    height: 1,
+                },
+                ClickAction::EcoToggle(i),
+            ));
+        }
+        hint.register(&mut self.clicks, area.x + 1, area.y + 1 + hint_index as u16);
+        content.push(hint.into_line());
+
         frame.render_widget(Clear, area);
         let para = Paragraph::new(content).block(
             Block::default()
@@ -1476,7 +1833,7 @@ impl App {
     /// space to be reclaimed, the current mode (trash vs permanent) and the
     /// keys. The accent colour and wording shift to red when the irreversible
     /// permanent mode is selected.
-    fn draw_confirm_delete(&self, frame: &mut Frame, permanent: bool) {
+    fn draw_confirm_delete(&mut self, frame: &mut Frame, permanent: bool) {
         let dirs = self.selected_dirs();
         let (count, bytes) = self.selected_total();
 
@@ -1549,16 +1906,38 @@ impl App {
         };
         lines.push(mode_line);
         lines.push(Line::raw(""));
-        lines.push(Line::from(vec![
-            Span::styled("  y/↵ ", Style::new().fg(accent).bold()),
-            Span::styled("confirm    ", Style::new().fg(Color::Gray)),
-            Span::styled("t ", Style::new().fg(Color::Cyan).bold()),
-            Span::styled("toggle mode    ", Style::new().fg(Color::Gray)),
-            Span::styled("n/Esc ", Style::new().fg(Color::Cyan).bold()),
-            Span::styled("cancel", Style::new().fg(Color::Gray)),
-        ]));
 
-        let area = centered_rect(frame.area(), 70, lines.len() as u16 + 2);
+        // The key legend doubles as buttons: confirm / toggle-mode / cancel.
+        let mut keys = ClickLine::default();
+        keys.button(
+            vec![
+                Span::styled("  y/↵ ", Style::new().fg(accent).bold()),
+                Span::styled("confirm", Style::new().fg(Color::Gray)),
+            ],
+            ClickAction::ConfirmYes,
+        );
+        keys.text(Span::styled("    ", Style::new().fg(Color::Gray)));
+        keys.button(
+            vec![
+                Span::styled("t ", Style::new().fg(Color::Cyan).bold()),
+                Span::styled("toggle mode", Style::new().fg(Color::Gray)),
+            ],
+            ClickAction::ConfirmToggleMode,
+        );
+        keys.text(Span::styled("    ", Style::new().fg(Color::Gray)));
+        keys.button(
+            vec![
+                Span::styled("n/Esc ", Style::new().fg(Color::Cyan).bold()),
+                Span::styled("cancel", Style::new().fg(Color::Gray)),
+            ],
+            ClickAction::ConfirmCancel,
+        );
+
+        let keys_index = lines.len();
+        let area = centered_rect(frame.area(), 70, (lines.len() + 1) as u16 + 2);
+        keys.register(&mut self.clicks, area.x + 1, area.y + 1 + keys_index as u16);
+        lines.push(keys.into_line());
+
         frame.render_widget(Clear, area);
         let title = if permanent {
             " ⚠ Permanently delete? "
@@ -1725,6 +2104,110 @@ fn age_color(modified: Option<SystemTime>) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// Render the app once against a headless backend so the click regions and
+    /// table area reflect a real frame, then return the terminal (kept alive by
+    /// the caller if needed).
+    fn render(app: &mut App, width: u16, height: u16) {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_sort_chip_cycles_the_sort() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        render(&mut app, 120, 24);
+
+        let (rect, _) = app
+            .clicks
+            .iter()
+            .find(|(_, a)| matches!(a, ClickAction::CycleSort))
+            .copied()
+            .expect("footer sort chip should register a click region");
+
+        let before = app.sort;
+        app.handle_click(rect.x, rect.y);
+        assert_eq!(app.sort, before.next());
+    }
+
+    #[test]
+    fn clicking_a_table_row_selects_it() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        // Default sort is size-descending, so "a" (100) precedes "b" (50).
+        app.rows.push(done_row("Node.js", "a", 100));
+        app.rows.push(done_row("Node.js", "b", 50));
+        render(&mut app, 120, 24);
+
+        let area = app.table_area.expect("table area recorded after a render");
+        // Click the second data row.
+        app.handle_click(area.x, area.y + 1);
+        assert_eq!(app.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn scroll_moves_the_selection_by_a_step() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        for _ in 0..10 {
+            app.rows.push(done_row("Node.js", "n", 100));
+        }
+        // From the top, one notch down advances by SCROLL_STEP rows.
+        app.select_first();
+        app.scroll(1);
+        assert_eq!(app.state.selected(), Some(SCROLL_STEP as usize));
+    }
+
+    #[test]
+    fn clicking_an_ecosystem_row_toggles_it() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        app.rows.push(done_row("Rust / Maven", "target", 200));
+        app.overlay = Overlay::Ecosystems { cursor: 0 };
+        render(&mut app, 120, 24);
+
+        // ecosystems_present() is sorted, so index 0 is "Node.js".
+        let (rect, _) = app
+            .clicks
+            .iter()
+            .find(|(_, a)| matches!(a, ClickAction::EcoToggle(0)))
+            .copied()
+            .expect("first ecosystem row should register a click region");
+
+        assert!(!app.disabled_ecos.contains("Node.js"));
+        app.handle_click(rect.x, rect.y);
+        assert!(app.disabled_ecos.contains("Node.js"));
+        // Clicking again re-enables it.
+        app.handle_click(rect.x, rect.y);
+        assert!(!app.disabled_ecos.contains("Node.js"));
+    }
+
+    #[test]
+    fn chrome_clicks_are_ignored_while_an_overlay_is_open() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        // Confirm dialog is up; the sort chip is still drawn behind it.
+        app.overlay = Overlay::ConfirmDelete { permanent: false };
+        render(&mut app, 120, 24);
+
+        let (rect, _) = app
+            .clicks
+            .iter()
+            .find(|(_, a)| matches!(a, ClickAction::CycleSort))
+            .copied()
+            .expect("sort chip is drawn behind the modal");
+
+        let before = app.sort;
+        app.handle_click(rect.x, rect.y);
+        // The chrome action must not fire through the modal.
+        assert_eq!(app.sort, before);
+    }
 
     #[test]
     fn bar_fills_proportionally() {

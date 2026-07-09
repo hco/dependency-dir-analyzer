@@ -51,6 +51,13 @@ pub struct Cli {
     #[arg(long)]
     pub plain: bool,
 
+    /// Disable mouse capture in the interactive UI, so the terminal's own
+    /// click-drag text selection and scrollback keep working. Also settable
+    /// with the `DDA_NO_MOUSE` environment variable or the persisted `mouse`
+    /// config setting; this flag overrides both.
+    #[arg(long)]
+    pub no_mouse: bool,
+
     /// Do not print the summary footer (plain table / non-interactive output).
     #[arg(long)]
     pub no_summary: bool,

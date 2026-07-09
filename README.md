@@ -69,6 +69,7 @@ Options:
       --follow-symlinks    Follow symbolic links while scanning
       --plain              Print a plain static table instead of the interactive TUI
       --no-summary         Do not print the summary footer (non-interactive output)
+      --no-mouse           Disable mouse capture in the interactive UI
   -h, --help               Print help
   -V, --version            Print version
 ```
@@ -103,6 +104,19 @@ When you press `d`, a confirmation dialog lists what will be removed and the
 space it frees. Deletions go to the **system trash** by default (recoverable);
 press `t` in the dialog to switch to an irreversible **permanent delete**, then
 `y` to confirm or `Esc` to cancel.
+
+### Mouse
+
+The TUI also responds to the mouse: the **scroll wheel** moves the selection, a
+**left click** highlights the row under the cursor, and the header filter chips,
+footer status chips (sort / group / unit / icons) and overlay controls are all
+**clickable** — each bound to the same action as its key.
+
+Capturing the mouse suppresses the terminal's own click-drag text selection and
+scrollback while the TUI runs (hold `Shift` to bypass in most terminals). To
+turn capture off, use any of — in priority order — the `--no-mouse` flag, the
+`DDA_NO_MOUSE` environment variable (`1`/`true` to disable, `0`/`false` to force
+on), or the persisted `mouse` setting in the view-state file.
 
 Examples:
 
