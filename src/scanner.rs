@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use rayon::prelude::*;
@@ -209,6 +211,7 @@ pub enum ScanEvent {
 fn walk_matches(
     root: &Path,
     opts: &ScanOptions,
+    cancel: &AtomicBool,
     mut on_warning: impl FnMut(String),
     mut on_match: impl FnMut(PathBuf, &'static Pattern),
 ) {
@@ -217,6 +220,12 @@ fn walk_matches(
         .into_iter();
 
     while let Some(entry) = walker.next() {
+        // Bail out of the walk promptly once the caller asks us to stop (e.g. the
+        // TUI has quit), instead of traversing the rest of the tree for results
+        // nobody is waiting for.
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -245,7 +254,9 @@ fn collect_matches(
     on_warning: impl FnMut(String),
 ) -> Vec<(PathBuf, &'static Pattern)> {
     let mut matches: Vec<(PathBuf, &'static Pattern)> = Vec::new();
-    walk_matches(root, opts, on_warning, |path, pattern| {
+    // The batch path always runs to completion, so cancellation never fires.
+    let never = AtomicBool::new(false);
+    walk_matches(root, opts, &never, on_warning, |path, pattern| {
         matches.push((path, pattern));
     });
     matches
@@ -258,9 +269,10 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
     let matches = collect_matches(root, opts, |w| eprintln!("warning: {w}"));
 
     // Sizing touches the filesystem a lot, so do it in parallel across matches.
+    let never = AtomicBool::new(false);
     let mut results: Vec<DependencyDir> = matches
         .into_par_iter()
-        .map(|(path, pattern)| size_match(path, pattern, opts.follow_symlinks))
+        .map(|(path, pattern)| size_match(path, pattern, opts.follow_symlinks, &never))
         .collect();
 
     sort_by_size(&mut results);
@@ -273,15 +285,25 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
 /// parallel on the rayon pool; each finished directory produces a `Sized` event.
 /// Returns once the walk is done and every match has been sized (or `tx` has
 /// hung up). Designed to run on a background thread feeding a live UI.
-pub fn scan_streaming(root: &Path, opts: &ScanOptions, tx: Sender<ScanEvent>) {
+pub fn scan_streaming(
+    root: &Path,
+    opts: &ScanOptions,
+    tx: Sender<ScanEvent>,
+    cancel: Arc<AtomicBool>,
+) {
     let follow = opts.follow_symlinks;
+    let cancel: &AtomicBool = &cancel;
 
     // The walk runs on this thread while sizing tasks are spawned onto the rayon
-    // pool. The scope waits for all sizing tasks before returning.
+    // pool. The scope waits for all sizing tasks before returning — so when the
+    // caller sets `cancel` (e.g. the TUI has quit), the walk stops spawning and
+    // in-flight sizing tasks bail early, letting the scan thread be joined
+    // promptly instead of finishing the whole tree first.
     rayon::scope(|scope| {
         walk_matches(
             root,
             opts,
+            cancel,
             |w| {
                 let _ = tx.send(ScanEvent::Warning(w));
             },
@@ -292,7 +314,7 @@ pub fn scan_streaming(root: &Path, opts: &ScanOptions, tx: Sender<ScanEvent>) {
                 });
                 let tx = tx.clone();
                 scope.spawn(move |_| {
-                    let dir = size_match(path, pattern, follow);
+                    let dir = size_match(path, pattern, follow, cancel);
                     let _ = tx.send(ScanEvent::Sized(dir));
                 });
             },
@@ -301,8 +323,13 @@ pub fn scan_streaming(root: &Path, opts: &ScanOptions, tx: Sender<ScanEvent>) {
 }
 
 /// Size a single matched directory into a [`DependencyDir`].
-fn size_match(path: PathBuf, pattern: &Pattern, follow_symlinks: bool) -> DependencyDir {
-    let (size_bytes, file_count, modified) = directory_stats(&path, follow_symlinks);
+fn size_match(
+    path: PathBuf,
+    pattern: &Pattern,
+    follow_symlinks: bool,
+    cancel: &AtomicBool,
+) -> DependencyDir {
+    let (size_bytes, file_count, modified) = directory_stats(&path, follow_symlinks, cancel);
     DependencyDir {
         path,
         ecosystem: pattern.ecosystem,
@@ -325,12 +352,21 @@ pub fn sort_by_size(results: &mut [DependencyDir]) {
 
 /// Sum the size and count of all regular files within `dir`, and find the most
 /// recent modification time of the directory and everything beneath it.
-fn directory_stats(dir: &Path, follow_symlinks: bool) -> (u64, u64, Option<SystemTime>) {
+fn directory_stats(
+    dir: &Path,
+    follow_symlinks: bool,
+    cancel: &AtomicBool,
+) -> (u64, u64, Option<SystemTime>) {
     let mut total = 0u64;
     let mut count = 0u64;
     let mut newest: Option<SystemTime> = None;
 
     for entry in WalkDir::new(dir).follow_links(follow_symlinks) {
+        // A single dependency directory can be enormous; checking here lets a
+        // cancelled scan abandon sizing mid-tree rather than walking it all.
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
@@ -400,7 +436,8 @@ mod tests {
         let tmp = make_tree("stream");
 
         let (tx, rx) = mpsc::channel();
-        scan_streaming(&tmp, &ScanOptions::default(), tx);
+        let cancel = Arc::new(AtomicBool::new(false));
+        scan_streaming(&tmp, &ScanOptions::default(), tx, cancel);
 
         let mut discovered = 0;
         let mut sized = Vec::new();

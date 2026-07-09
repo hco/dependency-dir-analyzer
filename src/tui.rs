@@ -10,7 +10,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, TryRecvError};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -52,8 +54,12 @@ pub fn run(
 ) -> Result<Vec<DependencyDir>> {
     let (tx, rx) = mpsc::channel();
     let root_buf = root.to_path_buf();
+    // Lets us tell the scan to stop when the user quits, so we don't block on
+    // `join` below while it finishes sizing a tree nobody is looking at anymore.
+    let cancel = Arc::new(AtomicBool::new(false));
+    let scan_cancel = Arc::clone(&cancel);
     let scan_thread = thread::spawn(move || {
-        scanner::scan_streaming(&root_buf, &opts, tx);
+        scanner::scan_streaming(&root_buf, &opts, tx, scan_cancel);
     });
 
     // Restore the view preferences last used for this directory. A `--icons`
@@ -68,6 +74,9 @@ pub fn run(
     let result = app.event_loop(&mut terminal, rx);
     ratatui::restore();
 
+    // Tell an unfinished scan to stop before we wait on it, so quitting mid-scan
+    // returns right away instead of blocking until the whole tree is sized.
+    cancel.store(true, Ordering::Relaxed);
     // The scan thread finishes once its `tx` is dropped at the end of
     // `scan_streaming`; joining keeps us from leaking it.
     let _ = scan_thread.join();
