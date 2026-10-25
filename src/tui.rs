@@ -1004,22 +1004,7 @@ impl App {
         self.delete_rx = Some(rx);
         thread::spawn(move || {
             for dir in targets {
-                let outcome =
-                    if dir.kind == DirKind::PnpmStore && store_action == StoreAction::Prune {
-                        prune_store(dir, follow)
-                    } else {
-                        match std::fs::remove_dir_all(&dir.path) {
-                            Ok(()) => DeleteOutcome::Removed {
-                                size: dir.freeable_bytes,
-                                path: dir.path,
-                            },
-                            Err(e) => DeleteOutcome::Failed {
-                                path: dir.path,
-                                verb: "delete",
-                                error: e.to_string(),
-                            },
-                        }
-                    };
+                let outcome = delete_target(dir, store_action, follow);
                 // The UI hung up (quit): stop early, nothing left to report to.
                 if tx.send(outcome).is_err() {
                     break;
@@ -2237,6 +2222,36 @@ impl App {
     }
 }
 
+/// Delete (or, for a pnpm store in prune mode, prune) one marked directory,
+/// for the deletion worker.
+fn delete_target(dir: DependencyDir, store_action: StoreAction, follow: bool) -> DeleteOutcome {
+    if dir.kind == DirKind::PnpmStore {
+        if store_action == StoreAction::Prune {
+            return prune_store(dir, follow);
+        }
+        // Re-checked right before removing: store paths come from files in
+        // the scanned tree, so never remove one that isn't laid out as a store.
+        if !pnpm::looks_like_store(&dir.path) {
+            return DeleteOutcome::Failed {
+                path: dir.path,
+                verb: "delete",
+                error: "does not look like a pnpm store".to_string(),
+            };
+        }
+    }
+    match std::fs::remove_dir_all(&dir.path) {
+        Ok(()) => DeleteOutcome::Removed {
+            size: dir.freeable_bytes,
+            path: dir.path,
+        },
+        Err(e) => DeleteOutcome::Failed {
+            path: dir.path,
+            verb: "delete",
+            error: e.to_string(),
+        },
+    }
+}
+
 /// Prune a marked pnpm store and re-measure it, for the deletion worker.
 fn prune_store(old: DependencyDir, follow_symlinks: bool) -> DeleteOutcome {
     match pnpm::prune(&old.path) {
@@ -2832,6 +2847,34 @@ mod tests {
             Row::Done(d) => assert_eq!(d.allocated_bytes, 320),
             Row::Pending { .. } => panic!("store row should stay sized"),
         }
+    }
+
+    #[test]
+    fn delete_mode_refuses_a_dir_that_is_not_a_store() {
+        let tmp = std::env::temp_dir().join(format!("dda-store-keep-{}", std::process::id()));
+        let not_store = tmp.join("v10");
+        std::fs::create_dir_all(&not_store).unwrap();
+        std::fs::write(not_store.join("precious"), b"x").unwrap();
+
+        let mut app = App::new(tmp.clone(), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.store_action = StoreAction::Delete;
+        app.rows
+            .push(Row::Done(store_dir_row(not_store.clone(), 1, 1)));
+        app.selected.insert(not_store.clone());
+
+        app.start_deletion();
+        for _ in 0..1000 {
+            app.drain_deletion();
+            if app.delete_progress.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(not_store.join("precious").exists());
+        assert_eq!(app.warnings, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

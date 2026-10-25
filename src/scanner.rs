@@ -416,7 +416,8 @@ fn referenced_store(path: &Path, pattern: &Pattern) -> Option<PathBuf> {
 }
 
 /// The pnpm stores to list: those projects referenced plus, if enabled, the
-/// default location's. Missing directories are dropped, the same store reached
+/// default location's. Missing directories and ones not laid out like a store
+/// are dropped, the same store reached
 /// by several paths is listed once (under the first path seen), and a store
 /// inside a matched directory is left out, since that row already counts it.
 pub(crate) fn collect_stores(
@@ -443,8 +444,12 @@ pub(crate) fn collect_stores(
             let Ok(canonical) = path.canonicalize() else {
                 return false;
             };
-            canonical.is_dir()
-                && !matched.iter().any(|m| canonical.starts_with(m))
+            // Neither inside a matched directory (that row counts it) nor
+            // around one (then it is a project tree, not a store).
+            pnpm::looks_like_store(&canonical)
+                && !matched
+                    .iter()
+                    .any(|m| canonical.starts_with(m) || m.starts_with(&canonical))
                 && seen.insert(canonical)
         })
         .collect()
@@ -705,6 +710,36 @@ mod tests {
             results.iter().all(|d| d.kind == DirKind::Dependency),
             "{results:?}"
         );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn store_dir_that_is_not_a_store_is_ignored() {
+        // A broken or hostile `.modules.yaml` must not turn arbitrary
+        // directories (the project itself, its parent, a random folder) into
+        // deletable "store" rows.
+        let tmp = fresh_dir("store-bogus");
+        let root = tmp.join("root");
+        let plain = tmp.join("plain");
+        fs::create_dir_all(plain.join("files")).unwrap();
+        let no_files = tmp.join("nofiles").join("v10");
+        fs::create_dir_all(&no_files).unwrap();
+        pnpm_project(&root, "a", &plain);
+        pnpm_project(&root, "b", &no_files);
+        pnpm_project(&root, "c", &tmp);
+        // A `v10/files` that contains the scanned projects is not a store.
+        let outer = tmp.join("v10");
+        fs::create_dir_all(outer.join("files")).unwrap();
+        pnpm_project(&outer, "d", &outer);
+
+        for scan_root in [&root, &outer] {
+            let results = scan(scan_root, &ScanOptions::default());
+            assert!(
+                results.iter().all(|d| d.kind == DirKind::Dependency),
+                "{results:?}"
+            );
+        }
 
         let _ = fs::remove_dir_all(&tmp);
     }

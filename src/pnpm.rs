@@ -164,6 +164,18 @@ fn shell_line(program: &str, args: &[String]) -> String {
     line
 }
 
+/// Whether `store` is laid out like a pnpm store: a `v<N>` directory holding
+/// `files/`. Paths come from `.modules.yaml` files in the scanned tree, so
+/// anything else (a broken or hostile `storeDir: /`) must never become a
+/// deletable row.
+pub fn looks_like_store(store: &Path) -> bool {
+    store
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_version_dir)
+        && store.join("files").is_dir()
+}
+
 /// Whether `name` looks like a store layout version directory (`v10`).
 fn is_version_dir(name: &str) -> bool {
     name.strip_prefix('v')
@@ -311,6 +323,20 @@ mod tests {
             err.contains("store prune --store-dir /definitely/not/a/store"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn store_layout_needs_version_name_and_files() {
+        let tmp = std::env::temp_dir().join(format!("dda-pnpm-{}-layout", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("v10").join("files")).unwrap();
+        std::fs::create_dir_all(tmp.join("v11")).unwrap();
+        std::fs::create_dir_all(tmp.join("other").join("files")).unwrap();
+        assert!(looks_like_store(&tmp.join("v10")));
+        assert!(!looks_like_store(&tmp.join("v11")));
+        assert!(!looks_like_store(&tmp.join("other")));
+        assert!(!looks_like_store(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
