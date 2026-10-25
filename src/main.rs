@@ -1,4 +1,5 @@
 mod cli;
+mod pnpm;
 mod report;
 mod scanner;
 mod state;
@@ -38,6 +39,7 @@ fn main() -> Result<()> {
 
     let opts = ScanOptions {
         follow_symlinks: args.follow_symlinks,
+        pnpm_default_store: !args.no_pnpm_default_store && state::settings().pnpm_default_store,
     };
     let root = args.path.display().to_string();
 
@@ -98,7 +100,7 @@ fn resolve_mouse(no_mouse_flag: bool) -> bool {
     {
         return !no_mouse;
     }
-    crate::state::settings().mouse
+    state::settings().mouse
 }
 
 /// Parse a boolean-ish environment variable value, returning `None` for unset,

@@ -186,17 +186,17 @@ fn nerd_icon(ecosystem: &str) -> &'static str {
         return "\u{e606}"; // nf-seti-python
     }
     match ecosystem {
-        "Node.js" | "Next.js" | "Nuxt" | "SvelteKit" | "Bower" => "\u{e718}", // nf-dev-nodejs_small
-        "Angular" => "\u{e753}",                                              // nf-dev-angular
-        "Rust / Maven" | "Cargo (cache)" => "\u{e7a8}",                       // nf-dev-rust
-        "Go / PHP / Ruby" => "\u{e724}",                                      // nf-dev-go
-        "Ruby (Bundler)" => "\u{e739}",                                       // nf-dev-ruby
-        "Gradle" => "\u{e660}",                                               // nf-seti-gradle
-        "Dart / Flutter" => "\u{e798}",                                       // nf-dev-dart
-        "Elm" => "\u{e62c}",                                                  // nf-seti-elm
-        "CocoaPods" | "Xcode" => "\u{e711}",                                  // nf-dev-apple
-        "Terraform" => "\u{e69a}",                                            // nf-seti-terraform
-        _ => "\u{f487}",                                                      // nf-oct-package
+        "Node.js" | "Next.js" | "Nuxt" | "SvelteKit" | "Bower" | "pnpm store" => "\u{e718}", // nf-dev-nodejs_small
+        "Angular" => "\u{e753}",                        // nf-dev-angular
+        "Rust / Maven" | "Cargo (cache)" => "\u{e7a8}", // nf-dev-rust
+        "Go / PHP / Ruby" => "\u{e724}",                // nf-dev-go
+        "Ruby (Bundler)" => "\u{e739}",                 // nf-dev-ruby
+        "Gradle" => "\u{e660}",                         // nf-seti-gradle
+        "Dart / Flutter" => "\u{e798}",                 // nf-dev-dart
+        "Elm" => "\u{e62c}",                            // nf-seti-elm
+        "CocoaPods" | "Xcode" => "\u{e711}",            // nf-dev-apple
+        "Terraform" => "\u{e69a}",                      // nf-seti-terraform
+        _ => "\u{f487}",                                // nf-oct-package
     }
 }
 
@@ -312,6 +312,10 @@ pub struct Settings {
     /// install, which never knew the trash mode, is handled in [`parse_store`]
     /// instead, which marks it acknowledged when there is no store at all.
     pub trash_removal_acknowledged: bool,
+    /// Whether pnpm's default store location is listed even when no project
+    /// in the scan points at it. The `--no-pnpm-default-store` flag turns it
+    /// off for one run.
+    pub pnpm_default_store: bool,
 }
 
 impl Default for Settings {
@@ -320,6 +324,7 @@ impl Default for Settings {
         Settings {
             mouse: true,
             trash_removal_acknowledged: false,
+            pnpm_default_store: true,
         }
     }
 }
@@ -579,6 +584,14 @@ mod tests {
         // Once acknowledged, it stays that way.
         let acked = br#"{"settings":{"trash_removal_acknowledged":true}}"#;
         assert!(parse_store(Some(acked)).settings.trash_removal_acknowledged);
+    }
+
+    #[test]
+    fn settings_default_to_pnpm_default_store_on() {
+        assert!(Settings::default().pnpm_default_store);
+        // A store written before the field existed keeps it on.
+        let old: Settings = serde_json::from_str(r#"{"mouse": false}"#).unwrap();
+        assert!(old.pnpm_default_store);
     }
 
     #[test]

@@ -8,6 +8,7 @@ use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
 
+use crate::pnpm;
 use crate::state::SizeMode;
 use crate::usage::{file_info, Usage, UsageAccumulator};
 
@@ -225,6 +226,9 @@ fn match_pattern(name: &str) -> Option<&'static Pattern> {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ScanOptions {
     pub follow_symlinks: bool,
+    /// Also list pnpm's default store location when no scanned project points
+    /// at it. Off by default so tests never touch the real store.
+    pub pnpm_default_store: bool,
 }
 
 /// An event emitted while a streaming scan is in progress. Consumers (such as
@@ -311,6 +315,12 @@ fn collect_matches(
 /// machine-readable output formats and tests.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
     let matches = collect_matches(root, opts, |w| eprintln!("warning: {w}"));
+    let referenced = matches
+        .iter()
+        .filter_map(|(path, pattern)| referenced_store(path, pattern))
+        .collect();
+    let matched: Vec<PathBuf> = matches.iter().map(|(path, _)| path.clone()).collect();
+    let stores = collect_stores(referenced, &matched, opts);
 
     // Sizing touches the filesystem a lot, so do it in parallel across matches.
     let never = AtomicBool::new(false);
@@ -318,6 +328,11 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
         .into_par_iter()
         .map(|(path, pattern)| size_match(path, pattern, opts.follow_symlinks, &never))
         .collect();
+    results.par_extend(
+        stores
+            .into_par_iter()
+            .map(|path| size_store(path, opts.follow_symlinks, &never)),
+    );
 
     sort_by_size(&mut results, SizeMode::Freeable);
     results
@@ -337,6 +352,8 @@ pub fn scan_streaming(
 ) {
     let follow = opts.follow_symlinks;
     let cancel: &AtomicBool = &cancel;
+    let mut referenced = Vec::new();
+    let mut matched = Vec::new();
 
     // The walk runs on this thread while sizing tasks are spawned onto the rayon
     // pool. The scope waits for all sizing tasks before returning — so when the
@@ -356,6 +373,8 @@ pub fn scan_streaming(
                     path: path.clone(),
                     ecosystem: pattern.ecosystem,
                 });
+                referenced.extend(referenced_store(&path, pattern));
+                matched.push(path.clone());
                 let tx = tx.clone();
                 scope.spawn(move |_| {
                     let dir = size_match(path, pattern, follow, cancel);
@@ -364,6 +383,83 @@ pub fn scan_streaming(
             },
         );
     });
+
+    // Stores come last: they are shared by the projects above, so they show up
+    // once those are in place, and a store is only known once the walk has
+    // read every project's `.modules.yaml`.
+    if cancel.load(Ordering::Relaxed) {
+        return;
+    }
+    let stores = collect_stores(referenced, &matched, opts);
+    rayon::scope(|scope| {
+        for path in stores {
+            let _ = tx.send(ScanEvent::Discovered {
+                path: path.clone(),
+                ecosystem: pnpm::STORE_ECOSYSTEM,
+            });
+            let tx = tx.clone();
+            scope.spawn(move |_| {
+                let dir = size_store(path, follow, cancel);
+                let _ = tx.send(ScanEvent::Sized(dir));
+            });
+        }
+    });
+}
+
+/// The pnpm store a matched `node_modules` was installed from, if any.
+fn referenced_store(path: &Path, pattern: &Pattern) -> Option<PathBuf> {
+    if pattern.name == "node_modules" {
+        pnpm::store_dir_for(path)
+    } else {
+        None
+    }
+}
+
+/// The pnpm stores to list: those projects referenced plus, if enabled, the
+/// default location's. Missing directories are dropped, the same store reached
+/// by several paths is listed once (under the first path seen), and a store
+/// inside a matched directory is left out, since that row already counts it.
+pub(crate) fn collect_stores(
+    referenced: Vec<PathBuf>,
+    matched: &[PathBuf],
+    opts: &ScanOptions,
+) -> Vec<PathBuf> {
+    let mut candidates = referenced;
+    if opts.pnpm_default_store {
+        candidates.extend(pnpm::default_store_dirs());
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let matched: Vec<PathBuf> = matched
+        .iter()
+        .filter_map(|m| m.canonicalize().ok())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|path| {
+            let Ok(canonical) = path.canonicalize() else {
+                return false;
+            };
+            canonical.is_dir()
+                && !matched.iter().any(|m| canonical.starts_with(m))
+                && seen.insert(canonical)
+        })
+        .collect()
+}
+
+/// Size a pnpm store into a row of its own.
+fn size_store(path: PathBuf, follow_symlinks: bool, cancel: &AtomicBool) -> DependencyDir {
+    size_dir(
+        path,
+        DirKind::PnpmStore,
+        pnpm::STORE_ECOSYSTEM,
+        pnpm::STORE_ECOSYSTEM,
+        follow_symlinks,
+        cancel,
+    )
 }
 
 /// Size a single matched directory into a [`DependencyDir`].
@@ -373,12 +469,31 @@ fn size_match(
     follow_symlinks: bool,
     cancel: &AtomicBool,
 ) -> DependencyDir {
+    size_dir(
+        path,
+        DirKind::Dependency,
+        pattern.ecosystem,
+        pattern.name,
+        follow_symlinks,
+        cancel,
+    )
+}
+
+/// Measure `path` into a [`DependencyDir`] row of the given kind and labels.
+pub(crate) fn size_dir(
+    path: PathBuf,
+    kind: DirKind,
+    ecosystem: &'static str,
+    name: &'static str,
+    follow_symlinks: bool,
+    cancel: &AtomicBool,
+) -> DependencyDir {
     let (usage, file_count, modified) = directory_stats(&path, follow_symlinks, cancel);
     DependencyDir {
         path,
-        ecosystem: pattern.ecosystem,
-        name: pattern.name,
-        kind: DirKind::Dependency,
+        ecosystem,
+        name,
+        kind,
         allocated_bytes: usage.allocated,
         freeable_bytes: usage.freeable,
         file_count,
@@ -506,6 +621,131 @@ mod tests {
         assert_eq!(discovered, 1);
         assert_eq!(sized.len(), 1);
         assert!(sized[0].allocated_bytes >= 12);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// A scan root with one pnpm project whose `.modules.yaml` points at
+    /// `store` (which the caller places wherever the test needs it).
+    fn pnpm_project(root: &Path, project: &str, store: &Path) {
+        let nm = root.join(project).join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        fs::write(nm.join("a.js"), b"hello").unwrap();
+        fs::write(
+            nm.join(".modules.yaml"),
+            format!("storeDir: {}\n", store.display()),
+        )
+        .unwrap();
+    }
+
+    fn make_store(store: &Path) {
+        fs::create_dir_all(store.join("files")).unwrap();
+        fs::write(store.join("files").join("blob"), vec![7u8; 4096]).unwrap();
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!("dda-test-{}-{tag}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(&tmp).unwrap();
+        tmp
+    }
+
+    #[test]
+    fn pnpm_store_referenced_by_project_becomes_a_row() {
+        let tmp = fresh_dir("store-row");
+        let root = tmp.join("root");
+        let store = tmp.join("store").join("v10");
+        make_store(&store);
+        pnpm_project(&root, "proj", &store);
+
+        let results = scan(&root, &ScanOptions::default());
+        let stores: Vec<_> = results
+            .iter()
+            .filter(|d| d.kind == DirKind::PnpmStore)
+            .collect();
+        assert_eq!(stores.len(), 1, "{results:?}");
+        assert_eq!(stores[0].path, store);
+        assert_eq!(stores[0].ecosystem, crate::pnpm::STORE_ECOSYSTEM);
+        assert!(stores[0].allocated_bytes >= 4096);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stores_are_deduplicated_by_canonical_path() {
+        let tmp = fresh_dir("store-dedupe");
+        let root = tmp.join("root");
+        let store = tmp.join("store").join("v10");
+        make_store(&store);
+        std::os::unix::fs::symlink(tmp.join("store"), tmp.join("alias")).unwrap();
+        pnpm_project(&root, "one", &store);
+        pnpm_project(&root, "two", &tmp.join("alias").join("v10"));
+        pnpm_project(&root, "three", &tmp.join("store").join("v10").join(""));
+
+        let results = scan(&root, &ScanOptions::default());
+        let stores = results
+            .iter()
+            .filter(|d| d.kind == DirKind::PnpmStore)
+            .count();
+        assert_eq!(stores, 1, "{results:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn store_inside_a_matched_dir_is_not_listed_separately() {
+        let tmp = fresh_dir("store-inside");
+        let store = tmp.join(".cache").join("pnpm").join("v10");
+        make_store(&store);
+        pnpm_project(&tmp, "proj", &store);
+
+        let results = scan(&tmp, &ScanOptions::default());
+        assert!(
+            results.iter().all(|d| d.kind == DirKind::Dependency),
+            "{results:?}"
+        );
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn missing_store_is_ignored() {
+        let tmp = fresh_dir("store-missing");
+        pnpm_project(&tmp, "proj", &tmp.join("gone").join("v10"));
+        let results = scan(&tmp, &ScanOptions::default());
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].kind, DirKind::Dependency);
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn streaming_sizes_stores_after_projects() {
+        let tmp = fresh_dir("store-stream");
+        let root = tmp.join("root");
+        let store = tmp.join("store").join("v10");
+        make_store(&store);
+        pnpm_project(&root, "a", &store);
+        pnpm_project(&root, "b", &store);
+
+        let (tx, rx) = mpsc::channel();
+        scan_streaming(
+            &root,
+            &ScanOptions::default(),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let kinds: Vec<DirKind> = rx
+            .iter()
+            .filter_map(|ev| match ev {
+                ScanEvent::Sized(d) => Some(d.kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [DirKind::Dependency, DirKind::Dependency, DirKind::PnpmStore]
+        );
 
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -53,6 +53,12 @@ pub struct Cli {
     #[arg(long, value_enum, value_name = "MODE")]
     pub size_mode: Option<SizeMode>,
 
+    /// Don't list pnpm's default store location unless a scanned project
+    /// uses it. Stores that projects point at are always listed. Also
+    /// settable with the persisted `pnpm_default_store` config setting.
+    #[arg(long)]
+    pub no_pnpm_default_store: bool,
+
     /// Print a plain static table instead of the interactive TUI, even on a
     /// terminal.
     #[arg(long)]
