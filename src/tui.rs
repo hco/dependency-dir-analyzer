@@ -67,7 +67,7 @@ pub fn run(
     top: usize,
     min_size: u64,
     icons: Option<IconStyle>,
-    _size_mode: Option<SizeMode>,
+    size_mode: Option<SizeMode>,
     mouse: bool,
 ) -> Result<Vec<DependencyDir>> {
     let (tx, rx) = mpsc::channel();
@@ -86,6 +86,9 @@ pub fn run(
     if let Some(style) = icons {
         view.icon_style = style;
     }
+    if let Some(mode) = size_mode {
+        view.size_mode = mode;
+    }
 
     let mut terminal = ratatui::init();
     // Capture the mouse so the UI can react to clicks and the scroll wheel,
@@ -100,6 +103,7 @@ pub fn run(
     let mut app = App::new(root.to_path_buf(), top, min_size, view);
     app.mouse_enabled = mouse;
     app.trash_notice_pending = !state::settings().trash_removal_acknowledged;
+    app.snapshots = crate::usage::has_local_snapshots();
     let result = app.event_loop(&mut terminal, rx);
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
@@ -205,6 +209,7 @@ enum ClickAction {
     ToggleGroup,
     CycleUnit,
     CycleIcons,
+    ToggleSizeMode,
     // Ecosystem overlay.
     EcoToggle(usize),
     EcoAllNone,
@@ -285,6 +290,9 @@ struct App {
     size_unit: SizeUnit,
     /// Which icon (if any) precedes the ecosystem label.
     icon_style: IconStyle,
+    /// Which byte count the size column shows, sorts and filters by. Deletion
+    /// figures always use the freeable bytes regardless.
+    size_mode: SizeMode,
     /// Ecosystems the user has toggled *off* in the ecosystem panel. Empty means
     /// every ecosystem is shown. Stored by label so it survives across restarts.
     disabled_ecos: HashSet<String>,
@@ -324,6 +332,9 @@ struct App {
     /// Cleared, and persisted, on their first confirmed deletion. Defaults to
     /// `false`; [`run`] sets it.
     trash_notice_pending: bool,
+    /// Whether local Time Machine snapshots exist, which keep deleted data
+    /// on disk until they expire. Defaults to `false`; [`run`] sets it.
+    snapshots: bool,
 }
 
 impl App {
@@ -341,6 +352,7 @@ impl App {
             age_filter: view.age_filter,
             size_unit: view.size_unit,
             icon_style: view.icon_style,
+            size_mode: view.size_mode,
             disabled_ecos: view.disabled_ecos,
             collapsed_ecos: view.collapsed_ecos,
             selected: HashSet::new(),
@@ -356,6 +368,7 @@ impl App {
             table_area: None,
             mouse_enabled: true,
             trash_notice_pending: false,
+            snapshots: false,
         }
     }
 
@@ -370,7 +383,7 @@ impl App {
             icon_style: self.icon_style,
             disabled_ecos: self.disabled_ecos.clone(),
             collapsed_ecos: self.collapsed_ecos.clone(),
-            size_mode: SizeMode::Freeable,
+            size_mode: self.size_mode,
         }
     }
 
@@ -521,6 +534,7 @@ impl App {
             KeyCode::Char('S') => self.sort = self.sort.next(),
             KeyCode::Char('u') => self.size_unit = self.size_unit.toggle(),
             KeyCode::Char('i') => self.icon_style = self.icon_style.cycle(),
+            KeyCode::Char('f') => self.size_mode = self.size_mode.toggle(),
             KeyCode::Char('g') => self.group = !self.group,
             KeyCode::Char('s') => self.size_filter = self.size_filter.next(),
             KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
@@ -667,6 +681,7 @@ impl App {
                     | ToggleGroup
                     | CycleUnit
                     | CycleIcons
+                    | ToggleSizeMode
             ),
             Overlay::Ecosystems { .. } => matches!(action, EcoToggle(_) | EcoAllNone),
             Overlay::TrashRemovedNotice => matches!(action, NoticeContinue | ConfirmCancel),
@@ -686,6 +701,7 @@ impl App {
             ClickAction::ToggleGroup => self.group = !self.group,
             ClickAction::CycleUnit => self.size_unit = self.size_unit.toggle(),
             ClickAction::CycleIcons => self.icon_style = self.icon_style.cycle(),
+            ClickAction::ToggleSizeMode => self.size_mode = self.size_mode.toggle(),
             ClickAction::EcoToggle(i) => self.toggle_eco_at(i),
             ClickAction::EcoAllNone => self.toggle_all_ecos(),
             ClickAction::NoticeContinue => self.overlay = Overlay::ConfirmDelete,
@@ -1028,8 +1044,8 @@ impl App {
 
     /// Whether a completed directory passes the active filters.
     fn passes(&self, d: &DependencyDir, now: SystemTime) -> bool {
-        d.bytes(SizeMode::Freeable) >= self.min_size
-            && d.bytes(SizeMode::Freeable) >= self.size_filter.min_bytes()
+        d.bytes(self.size_mode) >= self.min_size
+            && d.bytes(self.size_mode) >= self.size_filter.min_bytes()
             && !self.disabled_ecos.contains(d.ecosystem)
             && self.age_passes(d.modified, now)
     }
@@ -1102,14 +1118,14 @@ impl App {
             });
         }
         ordered.sort_by(|a, b| {
-            group_total(&b.1)
-                .cmp(&group_total(&a.1))
+            group_total(&b.1, self.size_mode)
+                .cmp(&group_total(&a.1, self.size_mode))
                 .then_with(|| a.0.cmp(b.0))
         });
 
         let mut items = Vec::new();
         for (eco, rows) in ordered {
-            let total = group_total(&rows);
+            let total = group_total(&rows, self.size_mode);
             let count = rows.iter().filter(|r| matches!(r, Row::Done(_))).count();
             let selected = rows
                 .iter()
@@ -1133,9 +1149,7 @@ impl App {
     fn compare(&self, a: &DependencyDir, b: &DependencyDir) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         let ord = match self.sort {
-            SortKey::Size => b
-                .bytes(SizeMode::Freeable)
-                .cmp(&a.bytes(SizeMode::Freeable)),
+            SortKey::Size => b.bytes(self.size_mode).cmp(&a.bytes(self.size_mode)),
             SortKey::Files => b.file_count.cmp(&a.file_count),
             SortKey::Name => a.name.cmp(b.name),
             // Most-recently modified first; unknown timestamps sort last.
@@ -1163,11 +1177,11 @@ impl App {
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if d.bytes(SizeMode::Freeable) >= self.min_size => Some(d.clone()),
+                Row::Done(d) if d.bytes(self.size_mode) >= self.min_size => Some(d.clone()),
                 _ => None,
             })
             .collect();
-        scanner::sort_by_size(&mut done, SizeMode::Freeable);
+        scanner::sort_by_size(&mut done, self.size_mode);
         if self.top > 0 && done.len() > self.top {
             done.truncate(self.top);
         }
@@ -1420,7 +1434,7 @@ impl App {
         let max_size = items
             .iter()
             .filter_map(|it| match it {
-                DisplayItem::Data(Row::Done(d)) => Some(d.bytes(SizeMode::Freeable)),
+                DisplayItem::Data(Row::Done(d)) => Some(d.bytes(self.size_mode)),
                 _ => None,
             })
             .max()
@@ -1428,7 +1442,7 @@ impl App {
 
         // Bar column width derives from the available area (the leading
         // checkbox column and its spacing take a few more cells than before).
-        let bar_width = (area.width as usize).saturating_sub(74).clamp(6, 24);
+        let bar_width = (area.width as usize).saturating_sub(76).clamp(6, 24);
 
         // Collect into an owned Vec so the immutable borrow of `self`/`items`
         // ends before the table is rendered with `&mut self.state` below.
@@ -1446,7 +1460,7 @@ impl App {
 
         let header = TableRow::new(vec![
             Cell::from(""),
-            Cell::from(Text::from("Size").right_aligned()),
+            Cell::from(Text::from(self.size_mode.column_title()).right_aligned()),
             Cell::from(""),
             Cell::from(Text::from("Files").right_aligned()),
             Cell::from("Modified"),
@@ -1457,7 +1471,8 @@ impl App {
 
         let widths = [
             Constraint::Length(1),
-            Constraint::Length(12),
+            // Room for `12,300 MB ⇄`.
+            Constraint::Length(14),
             Constraint::Length(bar_width as u16),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -1534,7 +1549,7 @@ impl App {
             }
             DisplayItem::Data(Row::Done(d)) => {
                 let frac = if max_size > 0 {
-                    d.bytes(SizeMode::Freeable) as f64 / max_size as f64
+                    d.bytes(self.size_mode) as f64 / max_size as f64
                 } else {
                     0.0
                 };
@@ -1544,10 +1559,8 @@ impl App {
                 let mark = if marked { "✓" } else { " " };
                 let row = TableRow::new(vec![
                     Cell::from(mark).style(Style::new().fg(SELECT_FG).bold()),
-                    Cell::from(
-                        Text::from(self.fmt_size(d.bytes(SizeMode::Freeable))).right_aligned(),
-                    )
-                    .style(Style::new().fg(color).bold()),
+                    Cell::from(Text::from(self.size_cell(d)).right_aligned())
+                        .style(Style::new().fg(color).bold()),
                     Cell::from(build_bar(frac, bar_width)).style(Style::new().fg(color)),
                     Cell::from(Text::from(group_thousands(d.file_count)).right_aligned())
                         .style(Style::new().fg(Color::Gray)),
@@ -1596,7 +1609,7 @@ impl App {
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if self.passes(d, now) => Some(d.bytes(SizeMode::Freeable)),
+                Row::Done(d) if self.passes(d, now) => Some(d.bytes(self.size_mode)),
                 _ => None,
             })
             .sum();
@@ -1622,7 +1635,16 @@ impl App {
             Style::new().fg(Color::Gray),
         ));
         chips.text(Span::raw("   "));
-        // sort/group/unit/icons double as click targets for their key actions.
+        // show/sort/group/unit/icons double as click targets for their key
+        // actions.
+        chips.button(
+            vec![Span::styled(
+                format!("show:{}", self.size_mode.label()),
+                Style::new().fg(Color::Green),
+            )],
+            ClickAction::ToggleSizeMode,
+        );
+        chips.text(Span::raw("  "));
         chips.button(
             vec![Span::styled(
                 format!("sort:{}", self.sort.label()),
@@ -1680,10 +1702,20 @@ impl App {
         // Two hint rows: view controls on top, the selection/deletion verbs
         // (which the footer chip already advertises with "press d to delete")
         // below.
-        let hints_view = Line::from(vec![Span::styled(
-            "↑/↓ move   S sort   g group   u unit   i icons   ↵ fold",
+        let mut hints_view = Line::from(vec![Span::styled(
+            "↑/↓ move   f freeable/on disk   S sort   g group   u unit   i icons   ↵ fold",
             Style::new().fg(Color::DarkGray),
         )]);
+        let any_shared = self
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Done(d) if d.mostly_shared() && self.passes(d, now)));
+        if any_shared {
+            hints_view.push_span(Span::styled(
+                "   ⇄ mostly shared — deleting frees little",
+                Style::new().fg(Color::Yellow),
+            ));
+        }
         let delete_hint = if sel_count > 0 {
             Span::styled("d delete", Style::new().fg(SELECT_FG).bold())
         } else {
@@ -1697,6 +1729,13 @@ impl App {
             delete_hint,
             Span::styled("   ? help   q quit", Style::new().fg(Color::DarkGray)),
         ]);
+        let mut hints_action = hints_action;
+        if self.snapshots {
+            hints_action.push_span(Span::styled(
+                "   Time Machine snapshots: space may only free up once they expire",
+                Style::new().fg(Color::Yellow),
+            ));
+        }
 
         let text = Text::from(vec![chips.into_line(), hints_view, hints_action]);
         let para = Paragraph::new(text).block(
@@ -1714,6 +1753,7 @@ impl App {
             help_line("Home / End", "first / last row"),
             Line::raw(""),
             help_line("S", "cycle sort (size · modified · name · files)"),
+            help_line("f", "toggle size shown (freeable · on disk)"),
             help_line("u", "toggle size units (MB · auto)"),
             help_line("i", "cycle ecosystem icons (emoji · nerd · off)"),
             help_line("g", "toggle grouping by ecosystem"),
@@ -2015,6 +2055,17 @@ impl App {
     }
 
     /// Render a byte count for the size column, honouring the current unit mode.
+    /// A row's size in the current mode, flagged with `⇄` when deleting it
+    /// would free little because most of it is shared outside.
+    fn size_cell(&self, d: &DependencyDir) -> String {
+        let size = self.fmt_size(d.bytes(self.size_mode));
+        if d.mostly_shared() {
+            format!("{size} ⇄")
+        } else {
+            size
+        }
+    }
+
     fn fmt_size(&self, bytes: u64) -> String {
         match self.size_unit {
             SizeUnit::Megabytes => megabytes_size(bytes),
@@ -2037,11 +2088,12 @@ fn now() -> SystemTime {
     SystemTime::now()
 }
 
-/// Sum of the done-row sizes in a group (pending rows contribute nothing).
-fn group_total(rows: &[&Row]) -> u64 {
+/// Sum of the done-row sizes in a group by `mode` (pending rows contribute
+/// nothing).
+fn group_total(rows: &[&Row], mode: SizeMode) -> u64 {
     rows.iter()
         .filter_map(|r| match r {
-            Row::Done(d) => Some(d.bytes(SizeMode::Freeable)),
+            Row::Done(d) => Some(d.bytes(mode)),
             _ => None,
         })
         .sum()
@@ -2374,6 +2426,117 @@ mod tests {
         app.reset_filters();
         assert!(!app.group);
         assert_eq!(count(&app), (0, 2));
+    }
+
+    fn sized_row(name: &'static str, allocated: u64, freeable: u64) -> Row {
+        Row::Done(DependencyDir {
+            path: PathBuf::from(format!("/tmp/{name}")),
+            ecosystem: "Node.js",
+            name: "node_modules",
+            kind: DirKind::Dependency,
+            allocated_bytes: allocated,
+            freeable_bytes: freeable,
+            file_count: 1,
+            modified: None,
+        })
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn size_mode_toggle_changes_sort_and_totals() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("a", 100, 90));
+        app.rows.push(sized_row("b", 200, 10));
+        let order = |app: &App| -> Vec<PathBuf> {
+            app.display_items(now())
+                .iter()
+                .filter_map(|it| match it {
+                    DisplayItem::Data(r) => Some(r.path().to_path_buf()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(app.size_mode, SizeMode::Freeable);
+        assert_eq!(
+            order(&app),
+            [PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.size_mode, SizeMode::Allocated);
+        assert_eq!(
+            order(&app),
+            [PathBuf::from("/tmp/b"), PathBuf::from("/tmp/a")]
+        );
+        assert_eq!(app.view_state().size_mode, SizeMode::Allocated);
+    }
+
+    #[test]
+    fn clicking_the_size_mode_chip_toggles_it() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        render(&mut app, 140, 24);
+
+        let (rect, _) = app
+            .clicks
+            .iter()
+            .find(|(_, a)| matches!(a, ClickAction::ToggleSizeMode))
+            .copied()
+            .expect("footer size-mode chip should register a click region");
+
+        app.handle_click(rect.x, rect.y);
+        assert_eq!(app.size_mode, SizeMode::Allocated);
+    }
+
+    #[test]
+    fn deletion_numbers_use_freeable() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.rows.push(sized_row("a", 100, 90));
+        app.size_mode = SizeMode::Allocated;
+        app.selected.insert(PathBuf::from("/tmp/a"));
+        assert_eq!(app.selected_total(), (1, 90));
+        assert_eq!(app.selected_dirs(), [(PathBuf::from("/tmp/a"), 90)]);
+    }
+
+    #[test]
+    fn mostly_shared_rows_show_marker() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("shared", 1000, 10));
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("⇄"), "{out}");
+        assert!(out.contains("mostly shared"), "{out}");
+
+        // Nothing shared, nothing to explain.
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("own", 1000, 1000));
+        let out = screen(&mut app, 140, 24);
+        assert!(!out.contains("mostly shared"), "{out}");
+    }
+
+    #[test]
+    fn snapshot_hint_shows_only_with_snapshots() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        assert!(!screen(&mut app, 140, 24).contains("Time Machine"));
+        app.snapshots = true;
+        assert!(screen(&mut app, 140, 24).contains("Time Machine snapshots"));
     }
 
     #[test]
