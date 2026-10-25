@@ -262,6 +262,7 @@ fn walk_matches(
     cancel: &AtomicBool,
     mut on_warning: impl FnMut(String),
     mut on_match: impl FnMut(PathBuf, &'static Pattern),
+    mut on_store: impl FnMut(PathBuf),
 ) {
     let mut walker = WalkDir::new(root)
         .follow_links(opts.follow_symlinks)
@@ -283,6 +284,13 @@ fn walk_matches(
         };
 
         if entry.file_type().is_dir() {
+            // A pnpm store is a row of its own, and its insides (pnpm 11 keeps
+            // real `node_modules` under `links/`) are not projects.
+            if pnpm::looks_like_store(entry.path()) {
+                on_store(entry.path().to_path_buf());
+                walker.skip_current_dir();
+                continue;
+            }
             if let Some(pattern) = entry.file_name().to_str().and_then(match_pattern) {
                 on_match(entry.path().to_path_buf(), pattern);
                 // Don't descend into a matched directory: we size it whole and
@@ -300,25 +308,32 @@ fn collect_matches(
     root: &Path,
     opts: &ScanOptions,
     on_warning: impl FnMut(String),
-) -> Vec<(PathBuf, &'static Pattern)> {
+) -> (Vec<(PathBuf, &'static Pattern)>, Vec<PathBuf>) {
     let mut matches: Vec<(PathBuf, &'static Pattern)> = Vec::new();
+    let mut stores = Vec::new();
     // The batch path always runs to completion, so cancellation never fires.
     let never = AtomicBool::new(false);
-    walk_matches(root, opts, &never, on_warning, |path, pattern| {
-        matches.push((path, pattern));
-    });
-    matches
+    walk_matches(
+        root,
+        opts,
+        &never,
+        on_warning,
+        |path, pattern| matches.push((path, pattern)),
+        |path| stores.push(path),
+    );
+    (matches, stores)
 }
 
 /// Walk `root` and find every dependency directory beneath it, returning the
 /// results sorted largest-first. This is the batch entry point used for the
 /// machine-readable output formats and tests.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
-    let matches = collect_matches(root, opts, |w| eprintln!("warning: {w}"));
-    let referenced = matches
-        .iter()
-        .filter_map(|(path, pattern)| referenced_store(path, pattern))
-        .collect();
+    let (matches, mut referenced) = collect_matches(root, opts, |w| eprintln!("warning: {w}"));
+    referenced.extend(
+        matches
+            .iter()
+            .filter_map(|(path, pattern)| referenced_store(path, pattern)),
+    );
     let matched: Vec<PathBuf> = matches.iter().map(|(path, _)| path.clone()).collect();
     let stores = collect_stores(referenced, &matched, opts);
 
@@ -354,6 +369,7 @@ pub fn scan_streaming(
     let cancel: &AtomicBool = &cancel;
     let mut referenced = Vec::new();
     let mut matched = Vec::new();
+    let mut walked_stores = Vec::new();
 
     // The walk runs on this thread while sizing tasks are spawned onto the rayon
     // pool. The scope waits for all sizing tasks before returning — so when the
@@ -381,6 +397,7 @@ pub fn scan_streaming(
                     let _ = tx.send(ScanEvent::Sized(dir));
                 });
             },
+            |path| walked_stores.push(path),
         );
     });
 
@@ -390,7 +407,8 @@ pub fn scan_streaming(
     if cancel.load(Ordering::Relaxed) {
         return;
     }
-    let stores = collect_stores(referenced, &matched, opts);
+    walked_stores.extend(referenced);
+    let stores = collect_stores(walked_stores, &matched, opts);
     rayon::scope(|scope| {
         for path in stores {
             let _ = tx.send(ScanEvent::Discovered {
@@ -529,6 +547,9 @@ fn directory_stats(
     let mut usage = UsageAccumulator::new(follow_symlinks);
     let mut count = 0u64;
     let mut newest: Option<SystemTime> = None;
+    // Depth of the followed directory symlink we are currently beneath, if
+    // any: everything under it lives elsewhere and survives deleting `dir`.
+    let mut linked_below: Option<usize> = None;
 
     for entry in WalkDir::new(dir).follow_links(follow_symlinks) {
         // A single dependency directory can be enormous; checking here lets a
@@ -540,9 +561,21 @@ fn directory_stats(
             Ok(e) => e,
             Err(_) => continue,
         };
+        if linked_below.is_some_and(|depth| entry.depth() <= depth) {
+            linked_below = None;
+        }
+        let linked = linked_below.is_some() || entry.path_is_symlink();
+        if linked_below.is_none() && entry.path_is_symlink() && entry.file_type().is_dir() {
+            linked_below = Some(entry.depth());
+        }
         if let Ok(meta) = entry.metadata() {
             if entry.file_type().is_file() {
-                usage.add(file_info(entry.path(), &meta));
+                let info = file_info(entry.path(), &meta);
+                if linked {
+                    usage.add_linked(info);
+                } else {
+                    usage.add(info);
+                }
                 count += 1;
             }
             if let Ok(modified) = meta.modified() {
@@ -643,9 +676,11 @@ mod tests {
         .unwrap();
     }
 
+    /// A minimal pnpm 10+ store: content under `files/<hex>/`, plus `index`.
     fn make_store(store: &Path) {
-        fs::create_dir_all(store.join("files")).unwrap();
-        fs::write(store.join("files").join("blob"), vec![7u8; 4096]).unwrap();
+        fs::create_dir_all(store.join("files").join("00")).unwrap();
+        fs::create_dir_all(store.join("index")).unwrap();
+        fs::write(store.join("files").join("00").join("blob"), vec![7u8; 4096]).unwrap();
     }
 
     fn fresh_dir(tag: &str) -> PathBuf {
@@ -740,6 +775,65 @@ mod tests {
                 "{results:?}"
             );
         }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn walk_lists_a_store_once_and_skips_its_internals() {
+        // pnpm 11 keeps a global virtual store with real `node_modules`
+        // inside the store; those are store internals, not projects.
+        let tmp = fresh_dir("store-walk");
+        let store = tmp.join("pnpm").join("v11");
+        make_store(&store);
+        let inner = store.join("links/@x/y/1.0.0/abc/node_modules/y");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("index.js"), b"x").unwrap();
+        fs::create_dir_all(tmp.join("proj").join("target")).unwrap();
+
+        for root in [&tmp, &store] {
+            let results = scan(root, &ScanOptions::default());
+            let stores: Vec<_> = results
+                .iter()
+                .filter(|d| d.kind == DirKind::PnpmStore)
+                .collect();
+            assert_eq!(stores.len(), 1, "{results:?}");
+            assert_eq!(stores[0].path, store);
+            assert!(
+                results
+                    .iter()
+                    .all(|d| !d.path.starts_with(&store) || d.path == store),
+                "{results:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follow_symlinks_does_not_count_link_targets_as_freeable() {
+        // A workspace package linked into node_modules stays on disk when the
+        // node_modules is deleted, so it isn't freeable.
+        let tmp = fresh_dir("follow-links");
+        let root = tmp.join("root");
+        let nm = root.join("app").join("node_modules");
+        fs::create_dir_all(&nm).unwrap();
+        let pkg = tmp.join("packages").join("lib");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("big.js"), vec![1u8; 64 * 1024]).unwrap();
+        fs::write(tmp.join("single.js"), vec![1u8; 64 * 1024]).unwrap();
+        std::os::unix::fs::symlink(&pkg, nm.join("lib")).unwrap();
+        std::os::unix::fs::symlink(tmp.join("single.js"), nm.join("single.js")).unwrap();
+
+        let opts = ScanOptions {
+            follow_symlinks: true,
+            ..Default::default()
+        };
+        let results = scan(&root, &opts);
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert!(results[0].allocated_bytes >= 128 * 1024, "{results:?}");
+        assert_eq!(results[0].freeable_bytes, 0, "{results:?}");
 
         let _ = fs::remove_dir_all(&tmp);
     }

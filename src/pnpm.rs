@@ -165,15 +165,37 @@ fn shell_line(program: &str, args: &[String]) -> String {
 }
 
 /// Whether `store` is laid out like a pnpm store: a `v<N>` directory holding
-/// `files/`. Paths come from `.modules.yaml` files in the scanned tree, so
-/// anything else (a broken or hostile `storeDir: /`) must never become a
-/// deletable row.
+/// `files/` plus either pnpm 10+'s index or project registry, or (pnpm 7-9's
+/// `v3`) two-hex-digit content buckets under `files/`. Paths come from
+/// `.modules.yaml` files in the scanned tree, so anything else (a broken or
+/// hostile `storeDir: /`) must never become a deletable row.
 pub fn looks_like_store(store: &Path) -> bool {
-    store
+    let named_like_store = store
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(is_version_dir)
-        && store.join("files").is_dir()
+        .is_some_and(is_version_dir);
+    let files = store.join("files");
+    if !named_like_store || !files.is_dir() {
+        return false;
+    }
+    ["index", "index.db", "projects", "links"]
+        .iter()
+        .any(|marker| store.join(marker).exists())
+        || has_hex_bucket(&files)
+}
+
+/// Whether `files` holds a content bucket such as `0a/`.
+fn has_hex_bucket(files: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(files) else {
+        return false;
+    };
+    entries.filter_map(|e| e.ok()).any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        name.len() == 2
+            && name.bytes().all(|b| b.is_ascii_hexdigit())
+            && e.file_type().is_ok_and(|t| t.is_dir())
+    })
 }
 
 /// Whether `name` looks like a store layout version directory (`v10`).
@@ -329,11 +351,25 @@ mod tests {
     fn store_layout_needs_version_name_and_files() {
         let tmp = std::env::temp_dir().join(format!("dda-pnpm-{}-layout", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(tmp.join("v10").join("files")).unwrap();
-        std::fs::create_dir_all(tmp.join("v11")).unwrap();
-        std::fs::create_dir_all(tmp.join("other").join("files")).unwrap();
+        let mk = |p: &str| std::fs::create_dir_all(tmp.join(p)).unwrap();
+        // pnpm 10/11: `files/` next to an index or project registry.
+        mk("v10/files");
+        mk("v10/index");
+        mk("v11/files");
+        std::fs::write(tmp.join("v11/index.db"), b"").unwrap();
+        // pnpm 7-9 (`v3`): only `files/`, with two-hex-digit buckets.
+        mk("v3/files/0a");
+        mk("v3/tmp");
+        // Look-alikes: a user folder with `files/` and a bare version dir.
+        mk("v2/files/photos");
+        mk("v12");
+        mk("other/files/00");
+        mk("other/index");
         assert!(looks_like_store(&tmp.join("v10")));
-        assert!(!looks_like_store(&tmp.join("v11")));
+        assert!(looks_like_store(&tmp.join("v11")));
+        assert!(looks_like_store(&tmp.join("v3")));
+        assert!(!looks_like_store(&tmp.join("v2")));
+        assert!(!looks_like_store(&tmp.join("v12")));
         assert!(!looks_like_store(&tmp.join("other")));
         assert!(!looks_like_store(&tmp));
         let _ = std::fs::remove_dir_all(&tmp);

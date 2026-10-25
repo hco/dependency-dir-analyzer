@@ -49,7 +49,7 @@ pub struct Usage {
 pub struct UsageAccumulator {
     dedupe_all_inodes: bool,
     usage: Usage,
-    /// Multiply-referenced inodes: `(dev, ino)` → (links seen, info).
+    /// Multiply-referenced inodes: `(dev, ino)` → (links seen directly, info).
     inodes: HashMap<(u64, u64), (u64, FileInfo)>,
     /// Clone families: id → (members seen, refcnt, largest allocation).
     clones: HashMap<u64, (u32, u32, u64)>,
@@ -70,20 +70,33 @@ impl UsageAccumulator {
         if f.nlink > 1 || self.dedupe_all_inodes {
             // Size each inode once; whether it is freeable depends on whether
             // all of its links turn up inside this tree, known only at the end.
-            let seen = self.inodes.entry((f.dev, f.ino)).or_insert((0, f));
-            if seen.0 == 0 {
-                self.usage.allocated += f.allocated;
-            }
-            seen.0 += 1;
+            self.track_inode(f).0 += 1;
             return;
         }
         self.usage.allocated += f.allocated;
         self.add_freeable(f);
     }
 
+    /// Add a file reached through a followed symlink. It occupies space, but
+    /// deleting the tree removes only the link, so unless the same inode is
+    /// also reached directly it is never freeable.
+    pub fn add_linked(&mut self, f: FileInfo) {
+        self.track_inode(f);
+    }
+
+    /// The tracking entry for `f`'s inode, counting its bytes the first time.
+    fn track_inode(&mut self, f: FileInfo) -> &mut (u64, FileInfo) {
+        let usage = &mut self.usage;
+        self.inodes.entry((f.dev, f.ino)).or_insert_with(|| {
+            usage.allocated += f.allocated;
+            (0, f)
+        })
+    }
+
     pub fn finish(mut self) -> Usage {
         for (seen, f) in std::mem::take(&mut self.inodes).into_values() {
-            if seen >= f.nlink {
+            // `seen` counts only direct paths, i.e. distinct hardlinks.
+            if seen > 0 && seen >= f.nlink {
                 self.add_freeable(f);
             }
         }
@@ -292,11 +305,26 @@ mod tests {
     }
 
     #[test]
+    fn files_reached_only_through_a_symlink_are_not_freeable() {
+        let file = f(4096, 5, 1, None);
+        let mut acc = UsageAccumulator::new(true);
+        acc.add_linked(file);
+        assert_eq!(acc.finish(), u(4096, 0));
+
+        // Also reached directly inside the tree: then it is the tree's own.
+        let mut acc = UsageAccumulator::new(true);
+        acc.add_linked(file);
+        acc.add(file);
+        assert_eq!(acc.finish(), u(4096, 4096));
+    }
+
+    #[test]
     fn follow_symlinks_counts_inode_once() {
         let files = [f(4096, 5, 1, None), f(4096, 5, 1, None)];
         assert_eq!(usage(true, &files), u(4096, 4096));
     }
 
+    #[cfg(unix)]
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dda-usage-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -304,6 +332,7 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
     fn info(path: &Path) -> FileInfo {
         let meta = std::fs::symlink_metadata(path).unwrap();
         file_info(path, &meta)

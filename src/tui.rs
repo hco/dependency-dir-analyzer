@@ -2881,8 +2881,9 @@ mod tests {
     fn delete_mode_removes_store_dir() {
         let tmp = std::env::temp_dir().join(format!("dda-store-del-{}", std::process::id()));
         let store = tmp.join("v10");
-        std::fs::create_dir_all(store.join("files")).unwrap();
-        std::fs::write(store.join("files").join("blob"), b"x").unwrap();
+        std::fs::create_dir_all(store.join("files").join("00")).unwrap();
+        std::fs::create_dir_all(store.join("index")).unwrap();
+        std::fs::write(store.join("files").join("00").join("blob"), b"x").unwrap();
 
         let mut app = App::new(tmp.clone(), 0, 0, ViewState::default());
         app.scanning = false;
