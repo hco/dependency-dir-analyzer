@@ -29,10 +29,6 @@ ratatui = "0.29"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 time = { version = "0.3", features = ["formatting"] }
-# Move-to-trash deletions in the interactive UI. Pure-Rust on every release
-# target (libc/once_cell on Linux, objc2 on macOS, the `windows` crate on
-# Windows), so it doesn't complicate cross-compilation.
-trash = "5.2"
 walkdir = "2.5"
 
 [profile.release]

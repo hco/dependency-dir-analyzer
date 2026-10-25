@@ -96,6 +96,7 @@ pub fn run(
     }
     let mut app = App::new(root.to_path_buf(), top, min_size, view);
     app.mouse_enabled = mouse;
+    app.trash_notice_pending = !state::settings().trash_removal_acknowledged;
     let result = app.event_loop(&mut terminal, rx);
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
@@ -149,12 +150,12 @@ enum Overlay {
     Ecosystems {
         cursor: usize,
     },
-    /// Confirmation gate before deleting the marked directories. `permanent`
-    /// toggles between moving to the OS trash (default) and an irreversible
-    /// `remove_dir_all`.
-    ConfirmDelete {
-        permanent: bool,
-    },
+    /// One-off notice for users upgrading from a version that moved deletions
+    /// to the system trash: shown before their first confirmation dialog so
+    /// the change to permanent deletion doesn't catch them out.
+    TrashRemovedNotice,
+    /// Confirmation gate before permanently deleting the marked directories.
+    ConfirmDelete,
 }
 
 /// The result of trying to remove one directory, sent back from the worker
@@ -170,7 +171,6 @@ struct DeleteProgress {
     total: usize,
     reclaimed: u64,
     failures: usize,
-    permanent: bool,
 }
 
 /// One rendered line of the table: an ecosystem group header (only when
@@ -205,9 +205,10 @@ enum ClickAction {
     // Ecosystem overlay.
     EcoToggle(usize),
     EcoAllNone,
-    // Confirm-delete overlay.
+    // Trash-removal notice.
+    NoticeContinue,
+    // Confirm-delete overlay (the cancel button is shared with the notice).
     ConfirmYes,
-    ConfirmToggleMode,
     ConfirmCancel,
 }
 
@@ -315,6 +316,11 @@ struct App {
     /// the help overlay advertises — with capture off no mouse events arrive, so
     /// the handlers are simply dormant. Defaults to `true`; [`run`] sets it.
     mouse_enabled: bool,
+    /// Whether this user still has to be told that deletions no longer go to
+    /// the system trash (see [`state::Settings::trash_removal_acknowledged`]).
+    /// Cleared, and persisted, on their first confirmed deletion. Defaults to
+    /// `false`; [`run`] sets it.
+    trash_notice_pending: bool,
 }
 
 impl App {
@@ -346,6 +352,7 @@ impl App {
             clicks: Vec::new(),
             table_area: None,
             mouse_enabled: true,
+            trash_notice_pending: false,
         }
     }
 
@@ -473,7 +480,11 @@ impl App {
                 self.handle_eco_key(code);
                 false
             }
-            Overlay::ConfirmDelete { .. } => {
+            Overlay::TrashRemovedNotice => {
+                self.handle_notice_key(code);
+                false
+            }
+            Overlay::ConfirmDelete => {
                 self.handle_confirm_key(code);
                 false
             }
@@ -517,23 +528,23 @@ impl App {
         false
     }
 
-    fn handle_confirm_key(&mut self, code: KeyCode) {
-        let permanent = match self.overlay {
-            Overlay::ConfirmDelete { permanent } => permanent,
-            _ => return,
-        };
+    fn handle_notice_key(&mut self, code: KeyCode) {
         match code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                self.overlay = Overlay::None;
-                self.start_deletion(permanent);
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.overlay = Overlay::ConfirmDelete;
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = Overlay::None;
             }
-            KeyCode::Char('t') | KeyCode::Char('T') => {
-                self.overlay = Overlay::ConfirmDelete {
-                    permanent: !permanent,
-                };
+            _ => {}
+        }
+    }
+
+    fn handle_confirm_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_deletion(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
+                self.overlay = Overlay::None;
             }
             _ => {}
         }
@@ -654,9 +665,8 @@ impl App {
                     | CycleIcons
             ),
             Overlay::Ecosystems { .. } => matches!(action, EcoToggle(_) | EcoAllNone),
-            Overlay::ConfirmDelete { .. } => {
-                matches!(action, ConfirmYes | ConfirmToggleMode | ConfirmCancel)
-            }
+            Overlay::TrashRemovedNotice => matches!(action, NoticeContinue | ConfirmCancel),
+            Overlay::ConfirmDelete => matches!(action, ConfirmYes | ConfirmCancel),
             Overlay::Help => false,
         }
     }
@@ -674,19 +684,8 @@ impl App {
             ClickAction::CycleIcons => self.icon_style = self.icon_style.cycle(),
             ClickAction::EcoToggle(i) => self.toggle_eco_at(i),
             ClickAction::EcoAllNone => self.toggle_all_ecos(),
-            ClickAction::ConfirmYes => {
-                if let Overlay::ConfirmDelete { permanent } = self.overlay {
-                    self.overlay = Overlay::None;
-                    self.start_deletion(permanent);
-                }
-            }
-            ClickAction::ConfirmToggleMode => {
-                if let Overlay::ConfirmDelete { permanent } = self.overlay {
-                    self.overlay = Overlay::ConfirmDelete {
-                        permanent: !permanent,
-                    };
-                }
-            }
+            ClickAction::NoticeContinue => self.overlay = Overlay::ConfirmDelete,
+            ClickAction::ConfirmYes => self.confirm_deletion(),
             ClickAction::ConfirmCancel => self.overlay = Overlay::None,
         }
     }
@@ -852,14 +851,32 @@ impl App {
         self.action = None;
     }
 
-    /// Open the delete-confirmation overlay, defaulting to the recoverable
-    /// move-to-trash mode. A no-op (with a nudge) when nothing is marked.
+    /// Open the delete-confirmation overlay — preceded by the trash-removal
+    /// notice for upgrading users who haven't deleted anything since. A no-op
+    /// (with a nudge) when nothing is marked.
     fn open_confirm_delete(&mut self) {
         if self.selected_total().0 == 0 {
             self.action = Some("Nothing marked — press space to mark directories.".to_string());
             return;
         }
-        self.overlay = Overlay::ConfirmDelete { permanent: false };
+        self.overlay = if self.trash_notice_pending {
+            Overlay::TrashRemovedNotice
+        } else {
+            Overlay::ConfirmDelete
+        };
+    }
+
+    /// The user confirmed the dialog: close it and start deleting. The first
+    /// confirmation also settles the trash-removal notice for good.
+    fn confirm_deletion(&mut self) {
+        self.overlay = Overlay::None;
+        if self.trash_notice_pending {
+            self.trash_notice_pending = false;
+            let mut settings = state::settings();
+            settings.trash_removal_acknowledged = true;
+            state::save_settings(&settings);
+        }
+        self.start_deletion();
     }
 
     /// Count and total size of the directories currently marked for deletion.
@@ -890,12 +907,11 @@ impl App {
         dirs
     }
 
-    /// Begin deleting every marked directory, either to the OS trash or
-    /// permanently. The removal runs on a worker thread — moving a large tree to
-    /// the trash (especially across volumes, where it becomes a recursive copy)
-    /// can take a while, and doing it inline would freeze the UI — while
-    /// `drain_deletion` applies the streamed results each tick.
-    fn start_deletion(&mut self, permanent: bool) {
+    /// Begin permanently deleting every marked directory. The removal runs on a
+    /// worker thread — removing a large tree can take a while, and doing it
+    /// inline would freeze the UI — while `drain_deletion` applies the streamed
+    /// results each tick.
+    fn start_deletion(&mut self) {
         let targets = self.selected_dirs();
         if targets.is_empty() {
             return;
@@ -906,16 +922,18 @@ impl App {
             total: targets.len(),
             reclaimed: 0,
             failures: 0,
-            permanent,
         });
 
         let (tx, rx) = mpsc::channel();
         self.delete_rx = Some(rx);
         thread::spawn(move || {
             for (path, size) in targets {
-                let outcome = match delete_path(&path, permanent) {
+                let outcome = match std::fs::remove_dir_all(&path) {
                     Ok(()) => DeleteOutcome::Removed { path, size },
-                    Err(error) => DeleteOutcome::Failed { path, error },
+                    Err(e) => DeleteOutcome::Failed {
+                        path,
+                        error: e.to_string(),
+                    },
                 };
                 // The UI hung up (quit): stop early, nothing left to report to.
                 if tx.send(outcome).is_err() {
@@ -967,17 +985,16 @@ impl App {
         let Some(p) = self.delete_progress.take() else {
             return;
         };
-        let verb = if p.permanent { "Deleted" } else { "Trashed" };
         let ok = p.done - p.failures;
         self.action = Some(if p.failures == 0 {
             format!(
-                "{verb} {ok} director{} · reclaimed {}",
+                "Deleted {ok} director{} · reclaimed {}",
                 if ok == 1 { "y" } else { "ies" },
                 self.fmt_size(p.reclaimed)
             )
         } else {
             format!(
-                "{verb} {ok}, {} failed · reclaimed {} · see ⚠",
+                "Deleted {ok}, {} failed · reclaimed {} · see ⚠",
                 p.failures,
                 self.fmt_size(p.reclaimed)
             )
@@ -1187,22 +1204,17 @@ impl App {
         match self.overlay {
             Overlay::Help => self.draw_help(frame),
             Overlay::Ecosystems { cursor } => self.draw_eco_panel(frame, cursor),
-            Overlay::ConfirmDelete { permanent } => self.draw_confirm_delete(frame, permanent),
+            Overlay::TrashRemovedNotice => self.draw_trash_notice(frame),
+            Overlay::ConfirmDelete => self.draw_confirm_delete(frame),
             Overlay::None => {}
         }
     }
 
     /// A spinner-and-progress modal shown while the worker thread removes the
-    /// marked directories, so a slow trash operation reads as "working", not
-    /// "frozen".
+    /// marked directories, so a slow removal reads as "working", not "frozen".
     fn draw_deleting(&self, frame: &mut Frame) {
         let Some(p) = &self.delete_progress else {
             return;
-        };
-        let verb = if p.permanent {
-            "Deleting"
-        } else {
-            "Moving to trash"
         };
         let lines = vec![
             Line::from(vec![
@@ -1211,7 +1223,7 @@ impl App {
                     Style::new().fg(Color::Yellow).bold(),
                 ),
                 Span::styled(
-                    format!("{verb} {} of {}…", (p.done + 1).min(p.total), p.total),
+                    format!("Deleting {} of {}…", (p.done + 1).min(p.total), p.total),
                     Style::new().fg(Color::White).bold(),
                 ),
             ]),
@@ -1830,10 +1842,9 @@ impl App {
     }
 
     /// The deletion confirmation modal: lists the marked directories, the total
-    /// space to be reclaimed, the current mode (trash vs permanent) and the
-    /// keys. The accent colour and wording shift to red when the irreversible
-    /// permanent mode is selected.
-    fn draw_confirm_delete(&mut self, frame: &mut Frame, permanent: bool) {
+    /// space to be reclaimed, a reminder that deletion is irreversible (plus
+    /// the trash-removal note for upgrading users) and the keys.
+    fn draw_confirm_delete(&mut self, frame: &mut Frame) {
         let dirs = self.selected_dirs();
         let (count, bytes) = self.selected_total();
 
@@ -1873,56 +1884,32 @@ impl App {
         ]));
         lines.push(Line::raw(""));
 
-        let (accent, mode_line) = if permanent {
-            (
-                Color::Red,
-                Line::from(vec![
-                    Span::styled("Mode: ", Style::new().fg(Color::Gray)),
-                    Span::styled(
-                        " PERMANENT DELETE ",
-                        Style::new().bg(Color::Red).fg(Color::White).bold(),
-                    ),
-                    Span::styled(
-                        "  irreversible — files are not recoverable",
-                        Style::new().fg(Color::Rgb(255, 150, 150)),
-                    ),
-                ]),
-            )
-        } else {
-            (
-                Color::Yellow,
-                Line::from(vec![
-                    Span::styled("Mode: ", Style::new().fg(Color::Gray)),
-                    Span::styled(
-                        " Move to Trash ",
-                        Style::new().bg(Color::Yellow).fg(Color::Black).bold(),
-                    ),
-                    Span::styled(
-                        "  recoverable from your system trash",
-                        Style::new().fg(Color::Rgb(210, 210, 160)),
-                    ),
-                ]),
-            )
-        };
-        lines.push(mode_line);
+        lines.push(Line::from(Span::styled(
+            "Permanent — this cannot be undone.",
+            Style::new().fg(Color::Rgb(255, 150, 150)),
+        )));
+        if self.trash_notice_pending {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    " NOTE ",
+                    Style::new().bg(Color::Yellow).fg(Color::Black).bold(),
+                ),
+                Span::styled(
+                    " no longer moved to the trash.",
+                    Style::new().fg(Color::Yellow),
+                ),
+            ]));
+        }
         lines.push(Line::raw(""));
 
-        // The key legend doubles as buttons: confirm / toggle-mode / cancel.
+        // The key legend doubles as buttons: confirm / cancel.
         let mut keys = ClickLine::default();
         keys.button(
             vec![
-                Span::styled("  y/↵ ", Style::new().fg(accent).bold()),
-                Span::styled("confirm", Style::new().fg(Color::Gray)),
+                Span::styled("  y/↵ ", Style::new().fg(Color::Red).bold()),
+                Span::styled("delete", Style::new().fg(Color::Gray)),
             ],
             ClickAction::ConfirmYes,
-        );
-        keys.text(Span::styled("    ", Style::new().fg(Color::Gray)));
-        keys.button(
-            vec![
-                Span::styled("t ", Style::new().fg(Color::Cyan).bold()),
-                Span::styled("toggle mode", Style::new().fg(Color::Gray)),
-            ],
-            ClickAction::ConfirmToggleMode,
         );
         keys.text(Span::styled("    ", Style::new().fg(Color::Gray)));
         keys.button(
@@ -1939,17 +1926,70 @@ impl App {
         lines.push(keys.into_line());
 
         frame.render_widget(Clear, area);
-        let title = if permanent {
-            " ⚠ Permanently delete? "
-        } else {
-            " Move to trash? "
-        };
         let para = Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::new().fg(accent))
-                .title(Span::styled(title, Style::new().fg(accent).bold()))
+                .border_style(Style::new().fg(Color::Red))
+                .title(Span::styled(
+                    " ⚠ Permanently delete? ",
+                    Style::new().fg(Color::Red).bold(),
+                ))
                 .style(Style::new().bg(Color::Rgb(24, 18, 22))),
+        );
+        frame.render_widget(para, area);
+    }
+
+    /// The one-off notice shown to upgrading users before their first
+    /// confirmation dialog: deletions used to go to the system trash, now they
+    /// are permanent.
+    fn draw_trash_notice(&mut self, frame: &mut Frame) {
+        let text = Style::new().fg(Color::White);
+        // Kept to short lines so the modal fits narrow terminals unclipped.
+        let mut lines = vec![
+            Line::from(Span::styled("Deletions are now permanent.", text.bold())),
+            Line::raw(""),
+            Line::from(Span::styled("Earlier versions of dda moved deleted", text)),
+            Line::from(Span::styled(
+                "directories to your system trash. Now they",
+                text,
+            )),
+            Line::from(Span::styled("are removed right away and cannot be", text)),
+            Line::from(Span::styled("recovered.", text)),
+            Line::raw(""),
+        ];
+
+        let mut keys = ClickLine::default();
+        keys.button(
+            vec![
+                Span::styled("  ↵ ", Style::new().fg(Color::Yellow).bold()),
+                Span::styled("got it, continue", Style::new().fg(Color::Gray)),
+            ],
+            ClickAction::NoticeContinue,
+        );
+        keys.text(Span::styled("    ", Style::new().fg(Color::Gray)));
+        keys.button(
+            vec![
+                Span::styled("Esc ", Style::new().fg(Color::Cyan).bold()),
+                Span::styled("cancel", Style::new().fg(Color::Gray)),
+            ],
+            ClickAction::ConfirmCancel,
+        );
+
+        let keys_index = lines.len();
+        let area = centered_rect(frame.area(), 70, (lines.len() + 1) as u16 + 2);
+        keys.register(&mut self.clicks, area.x + 1, area.y + 1 + keys_index as u16);
+        lines.push(keys.into_line());
+
+        frame.render_widget(Clear, area);
+        let para = Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::new().fg(Color::Yellow))
+                .title(Span::styled(
+                    " ⚠ Heads up: no more trash ",
+                    Style::new().fg(Color::Yellow).bold(),
+                ))
+                .style(Style::new().bg(Color::Rgb(24, 22, 16))),
         );
         frame.render_widget(para, area);
     }
@@ -1985,17 +2025,6 @@ impl App {
 
 fn now() -> SystemTime {
     SystemTime::now()
-}
-
-/// Remove a directory tree, either by moving it to the OS trash (recoverable)
-/// or deleting it permanently. Errors are reported as a string so the caller can
-/// surface them in the UI without depending on the `trash` error type.
-fn delete_path(path: &Path, permanent: bool) -> std::result::Result<(), String> {
-    if permanent {
-        std::fs::remove_dir_all(path).map_err(|e| e.to_string())
-    } else {
-        trash::delete(path).map_err(|e| e.to_string())
-    }
 }
 
 /// Sum of the done-row sizes in a group (pending rows contribute nothing).
@@ -2193,7 +2222,7 @@ mod tests {
         app.scanning = false;
         app.rows.push(done_row("Node.js", "node_modules", 100));
         // Confirm dialog is up; the sort chip is still drawn behind it.
-        app.overlay = Overlay::ConfirmDelete { permanent: false };
+        app.overlay = Overlay::ConfirmDelete;
         render(&mut app, 120, 24);
 
         let (rect, _) = app
@@ -2381,7 +2410,43 @@ mod tests {
     }
 
     #[test]
-    fn permanent_deletion_removes_dir_and_prunes_row() {
+    fn trash_notice_precedes_the_confirm_dialog_until_acknowledged() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        app.selected.insert(PathBuf::from("/tmp/node_modules"));
+
+        // Without a pending notice, `d` goes straight to the confirmation.
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::ConfirmDelete));
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+
+        // An upgrading user sees the notice first; cancelling keeps it pending.
+        app.trash_notice_pending = true;
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::TrashRemovedNotice));
+        app.handle_key(KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::None));
+        assert!(app.trash_notice_pending);
+
+        // Continuing leads on to the confirmation, which repeats the note.
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::ConfirmDelete));
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(screen.contains("no longer moved to the trash"));
+    }
+
+    #[test]
+    fn deletion_removes_dir_and_prunes_row() {
         let tmp = std::env::temp_dir().join(format!("dda-del-test-{}", std::process::id()));
         let victim = tmp.join("node_modules");
         std::fs::create_dir_all(&victim).unwrap();
@@ -2401,7 +2466,7 @@ mod tests {
         app.selected.insert(victim.clone());
 
         // Deletion runs on a worker thread; pump the drain until it finishes.
-        app.start_deletion(true);
+        app.start_deletion();
         for _ in 0..1000 {
             app.drain_deletion();
             if app.delete_progress.is_none() {

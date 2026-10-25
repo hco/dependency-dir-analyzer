@@ -1,5 +1,6 @@
 //! Persistence of the interactive view preferences (sort, grouping, filters and
-//! folded groups) so they survive across restarts, keyed by the scan root.
+//! folded groups) so they survive across restarts, keyed by the scan root, plus
+//! a few global settings.
 //!
 //! The store is a single JSON file mapping a canonicalised directory path to the
 //! [`ViewState`] last used there. All filesystem access is best-effort: a
@@ -267,12 +268,24 @@ pub struct Settings {
     /// of the mouse opt-out; the `--no-mouse` flag and `DDA_NO_MOUSE`
     /// environment variable override it at runtime.
     pub mouse: bool,
+    /// Whether the user has acknowledged that deletions no longer go to the
+    /// system trash. Older versions trashed by default, so someone upgrading
+    /// gets a one-off notice before their first (now permanent) deletion.
+    ///
+    /// The `Default` is `false` ("notice pending") on purpose: a store written
+    /// by an older version lacks this field and must come out pending. A fresh
+    /// install, which never knew the trash mode, is handled in [`parse_store`]
+    /// instead, which marks it acknowledged when there is no store at all.
+    pub trash_removal_acknowledged: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         // Mouse capture is on by default; disabling it is opt-in.
-        Settings { mouse: true }
+        Settings {
+            mouse: true,
+            trash_removal_acknowledged: false,
+        }
     }
 }
 
@@ -321,31 +334,58 @@ pub fn settings() -> Settings {
 /// global settings) untouched. Errors are intentionally swallowed — this is a
 /// best-effort convenience.
 pub fn save(root: &Path, state: &ViewState) {
+    let mut store = load_store();
+    store.roots.insert(key_for(root), state.clone());
+    write_store(&store);
+}
+
+/// Persist the global `settings`, leaving every directory's view state
+/// untouched. Best-effort, like [`save`].
+pub fn save_settings(settings: &Settings) {
+    let mut store = load_store();
+    store.settings = settings.clone();
+    write_store(&store);
+}
+
+/// Write the whole store to disk, ignoring errors.
+fn write_store(store: &Store) {
     let Some(path) = store_path() else {
         return;
     };
-    let mut store = load_store();
-    store.roots.insert(key_for(root), state.clone());
-
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_vec_pretty(&store) {
+    if let Ok(json) = serde_json::to_vec_pretty(store) {
         let _ = std::fs::write(&path, json);
     }
 }
 
-/// Read the whole store, or defaults if it can't be read. A file written by an
-/// older version (a bare path→[`ViewState`] map, with no global settings) is
-/// migrated in place so existing per-root preferences survive the upgrade.
+/// Read the whole store, or defaults if it can't be read.
 fn load_store() -> Store {
-    let Some(bytes) = store_path().and_then(|p| std::fs::read(p).ok()) else {
-        return Store::default();
+    let bytes = store_path().and_then(|p| std::fs::read(p).ok());
+    parse_store(bytes.as_deref())
+}
+
+/// Interpret the raw store contents (`None` when there is no store file). A
+/// file written by an older version (a bare path→[`ViewState`] map, with no
+/// global settings) is migrated so existing per-root preferences survive the
+/// upgrade.
+fn parse_store(bytes: Option<&[u8]>) -> Store {
+    let Some(bytes) = bytes else {
+        // No store yet: a fresh install that never had the trash mode, so there
+        // is nothing to warn about.
+        return Store {
+            settings: Settings {
+                trash_removal_acknowledged: true,
+                ..Settings::default()
+            },
+            roots: HashMap::new(),
+        };
     };
-    if let Ok(store) = serde_json::from_slice::<Store>(&bytes) {
+    if let Ok(store) = serde_json::from_slice::<Store>(bytes) {
         return store;
     }
-    if let Ok(roots) = serde_json::from_slice::<HashMap<String, ViewState>>(&bytes) {
+    if let Ok(roots) = serde_json::from_slice::<HashMap<String, ViewState>>(bytes) {
         return Store {
             settings: Settings::default(),
             roots,
@@ -444,7 +484,11 @@ mod tests {
     fn settings_default_to_mouse_on() {
         assert!(Settings::default().mouse);
         // A stored settings object round-trips its value.
-        let json = serde_json::to_vec(&Settings { mouse: false }).unwrap();
+        let json = serde_json::to_vec(&Settings {
+            mouse: false,
+            ..Settings::default()
+        })
+        .unwrap();
         let back: Settings = serde_json::from_slice(&json).unwrap();
         assert!(!back.mouse);
         // A partial/empty object falls back to the mouse-on default.
@@ -458,7 +502,10 @@ mod tests {
         let mut roots = HashMap::new();
         roots.insert("/tmp/foo".to_string(), ViewState::default());
         let store = Store {
-            settings: Settings { mouse: false },
+            settings: Settings {
+                mouse: false,
+                ..Settings::default()
+            },
             roots,
         };
         let json = serde_json::to_vec(&store).unwrap();
@@ -473,6 +520,29 @@ mod tests {
         // ...but still deserializes as the old map, which `load_store` migrates.
         let roots: HashMap<String, ViewState> = serde_json::from_slice(legacy).unwrap();
         assert!(roots["/tmp/foo"].group);
+    }
+
+    #[test]
+    fn trash_removal_notice_is_only_pending_for_existing_stores() {
+        // Fresh install: no store file, never saw the trash mode.
+        assert!(parse_store(None).settings.trash_removal_acknowledged);
+        // A store written before the notice existed (current format, no field).
+        let pre_notice = br#"{"settings":{"mouse":true},"roots":{}}"#;
+        assert!(
+            !parse_store(Some(pre_notice))
+                .settings
+                .trash_removal_acknowledged
+        );
+        // The legacy bare map predates settings entirely.
+        let legacy = br#"{"/tmp/foo":{"group":true}}"#;
+        assert!(
+            !parse_store(Some(legacy))
+                .settings
+                .trash_removal_acknowledged
+        );
+        // Once acknowledged, it stays that way.
+        let acked = br#"{"settings":{"trash_removal_acknowledged":true}}"#;
+        assert!(parse_store(Some(acked)).settings.trash_removal_acknowledged);
     }
 
     #[test]

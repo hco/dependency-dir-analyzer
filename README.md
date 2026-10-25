@@ -15,7 +15,7 @@ The binary is called **`dda`**. Install it with Homebrew:
 brew install hco/tap/dda
 ```
 
-![dda scanning a project tree, marking directories, and confirming a trash-it deletion](demo/demo.gif)
+![dda scanning a project tree, marking directories, and confirming a deletion](demo/demo.gif)
 
 ## Features
 
@@ -24,8 +24,7 @@ brew install hco/tap/dda
   ecosystem, and filter by size or age.
 - **Reclaim space safely** — mark the directories you want gone (one at a time,
   a whole ecosystem, or everything visible), watch the total to-be-freed size
-  add up, then delete them after a confirmation step. Deletions move to the
-  system trash by default (recoverable), with an opt-in permanent mode.
+  add up, then delete them after a confirmation step.
 - **Size _and_ last-modified time** — stale directories (good cleanup
   candidates) are colour-coded by age, so you can tell a six-month-old
   `node_modules` from one you built this morning.
@@ -101,9 +100,10 @@ are always non-interactive.
 | `q` / `Esc`          | Quit                                        |
 
 When you press `d`, a confirmation dialog lists what will be removed and the
-space it frees. Deletions go to the **system trash** by default (recoverable);
-press `t` in the dialog to switch to an irreversible **permanent delete**, then
-`y` to confirm or `Esc` to cancel.
+space it frees; press `y` to confirm or `Esc` to cancel. Deletion is
+**permanent** — directories are removed right away, not moved to the system
+trash. They are dependency directories, so your package manager or build tool
+can regenerate them.
 
 ### Mouse
 

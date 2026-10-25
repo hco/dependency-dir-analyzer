@@ -12,10 +12,11 @@ space each one uses and when it was last modified.
 
 On a terminal the default output is an interactive, live-updating TUI (built on
 `ratatui` + `crossterm`) that streams results in as they are found and sized.
-From the TUI you can also mark directories and delete them — to the system trash
-by default (via the `trash` crate) or permanently — behind a confirmation
-dialog. When the output is piped/redirected — or with `--plain` — it prints a
-plain aligned table; `--format json` and `--format csv` are always
+From the TUI you can also mark directories and permanently delete them behind a
+confirmation dialog. (Older versions moved them to the system trash; upgrading
+users get a one-off notice before their first deletion, tracked in `state.rs`.)
+When the output is piped/redirected — or with `--plain` — it prints a plain
+aligned table; `--format json` and `--format csv` are always
 non-interactive. Shell completions are available via `dda completions <shell>`.
 
 The installed binary is named **`dda`** (the crate is `dependency-dir-analyzer`).
