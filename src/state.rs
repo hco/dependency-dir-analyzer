@@ -70,6 +70,41 @@ impl SizeUnit {
     }
 }
 
+/// Which byte count the size column shows. Toggled with `f` in the TUI and
+/// settable up front with `--size-mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+pub enum SizeMode {
+    /// What deleting the directory would actually give back: bytes not shared
+    /// (via hardlinks or APFS clones) with anything outside it.
+    #[default]
+    Freeable,
+    /// Allocated on disk, like `du`: hardlinked inodes count once.
+    Allocated,
+}
+
+impl SizeMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            SizeMode::Freeable => SizeMode::Allocated,
+            SizeMode::Allocated => SizeMode::Freeable,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SizeMode::Freeable => "freeable",
+            SizeMode::Allocated => "on disk",
+        }
+    }
+
+    pub fn column_title(self) -> &'static str {
+        match self {
+            SizeMode::Freeable => "Freeable",
+            SizeMode::Allocated => "On disk",
+        }
+    }
+}
+
 /// How (and whether) an icon is shown next to each ecosystem. Cycled with `i`
 /// in the TUI and settable up front with `--icons`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
@@ -317,6 +352,7 @@ pub struct ViewState {
     pub collapsed_ecos: HashSet<String>,
     pub size_unit: SizeUnit,
     pub icon_style: IconStyle,
+    pub size_mode: SizeMode,
 }
 
 /// Load the saved view state for `root`, or defaults if none is stored.
@@ -543,6 +579,23 @@ mod tests {
         // Once acknowledged, it stays that way.
         let acked = br#"{"settings":{"trash_removal_acknowledged":true}}"#;
         assert!(parse_store(Some(acked)).settings.trash_removal_acknowledged);
+    }
+
+    #[test]
+    fn size_mode_toggles_and_round_trips() {
+        assert_eq!(SizeMode::default(), SizeMode::Freeable);
+        assert_eq!(SizeMode::Freeable.toggle(), SizeMode::Allocated);
+        assert_eq!(SizeMode::Freeable.toggle().toggle(), SizeMode::Freeable);
+
+        let state = ViewState {
+            size_mode: SizeMode::Allocated,
+            ..Default::default()
+        };
+        let back: ViewState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(back.size_mode, SizeMode::Allocated);
+        // Stores written before the field existed default to freeable.
+        let old: ViewState = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.size_mode, SizeMode::Freeable);
     }
 
     #[test]

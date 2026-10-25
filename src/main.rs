@@ -13,7 +13,7 @@ use clap_complete::{generate, Shell};
 
 use crate::cli::{Cli, Command, Format};
 use crate::report::Report;
-use crate::scanner::{scan, ScanOptions};
+use crate::scanner::{scan, sort_by_size, ScanOptions};
 
 fn main() -> Result<()> {
     let args = Cli::parse();
@@ -48,22 +48,33 @@ fn main() -> Result<()> {
 
     if interactive {
         let mouse = resolve_mouse(args.no_mouse);
-        tui::run(&args.path, opts, args.top, min_size, args.icons, mouse)
-            .context("interactive UI failed")?;
+        tui::run(
+            &args.path,
+            opts,
+            args.top,
+            min_size,
+            args.icons,
+            args.size_mode,
+            mouse,
+        )
+        .context("interactive UI failed")?;
         return Ok(());
     }
 
+    // Batch output has no remembered view, so an unset mode means freeable.
+    let mode = args.size_mode.unwrap_or_default();
     let mut directories = scan(&args.path, &opts);
     if min_size > 0 {
-        directories.retain(|d| d.size_bytes >= min_size);
+        directories.retain(|d| d.bytes(mode) >= min_size);
     }
+    sort_by_size(&mut directories, mode);
     if args.top > 0 && directories.len() > args.top {
         directories.truncate(args.top);
     }
 
     let report = Report::new(&root, &directories);
     match args.format {
-        Format::Table => report::print_table(&report, !args.no_summary)
+        Format::Table => report::print_table(&report, !args.no_summary, mode)
             .context("failed to write table output")?,
         Format::Json => report::print_json(&report).context("failed to write JSON output")?,
         Format::Csv => report::print_csv(&report).context("failed to write CSV output")?,

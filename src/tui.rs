@@ -36,7 +36,9 @@ use ratatui::DefaultTerminal;
 
 use crate::report::{group_thousands, human_size, megabytes_size, relative_age};
 use crate::scanner::{self, DependencyDir, ScanEvent, ScanOptions};
-use crate::state::{self, AgeFilter, IconStyle, SizeFilter, SizeUnit, SortKey, ViewState};
+use crate::state::{
+    self, AgeFilter, IconStyle, SizeFilter, SizeMode, SizeUnit, SortKey, ViewState,
+};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Redraw cadence while something is animating (the scan or a deletion is
@@ -65,6 +67,7 @@ pub fn run(
     top: usize,
     min_size: u64,
     icons: Option<IconStyle>,
+    _size_mode: Option<SizeMode>,
     mouse: bool,
 ) -> Result<Vec<DependencyDir>> {
     let (tx, rx) = mpsc::channel();
@@ -367,6 +370,7 @@ impl App {
             icon_style: self.icon_style,
             disabled_ecos: self.disabled_ecos.clone(),
             collapsed_ecos: self.collapsed_ecos.clone(),
+            size_mode: SizeMode::Freeable,
         }
     }
 
@@ -884,7 +888,9 @@ impl App {
         self.rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if self.selected.contains(&d.path) => Some(d.size_bytes),
+                Row::Done(d) if self.selected.contains(&d.path) => {
+                    Some(d.bytes(SizeMode::Freeable))
+                }
                 _ => None,
             })
             .fold((0, 0), |(n, bytes), size| (n + 1, bytes + size))
@@ -898,7 +904,7 @@ impl App {
             .iter()
             .filter_map(|r| match r {
                 Row::Done(d) if self.selected.contains(&d.path) => {
-                    Some((d.path.clone(), d.size_bytes))
+                    Some((d.path.clone(), d.bytes(SizeMode::Freeable)))
                 }
                 _ => None,
             })
@@ -1022,8 +1028,8 @@ impl App {
 
     /// Whether a completed directory passes the active filters.
     fn passes(&self, d: &DependencyDir, now: SystemTime) -> bool {
-        d.size_bytes >= self.min_size
-            && d.size_bytes >= self.size_filter.min_bytes()
+        d.bytes(SizeMode::Freeable) >= self.min_size
+            && d.bytes(SizeMode::Freeable) >= self.size_filter.min_bytes()
             && !self.disabled_ecos.contains(d.ecosystem)
             && self.age_passes(d.modified, now)
     }
@@ -1127,7 +1133,9 @@ impl App {
     fn compare(&self, a: &DependencyDir, b: &DependencyDir) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         let ord = match self.sort {
-            SortKey::Size => b.size_bytes.cmp(&a.size_bytes),
+            SortKey::Size => b
+                .bytes(SizeMode::Freeable)
+                .cmp(&a.bytes(SizeMode::Freeable)),
             SortKey::Files => b.file_count.cmp(&a.file_count),
             SortKey::Name => a.name.cmp(b.name),
             // Most-recently modified first; unknown timestamps sort last.
@@ -1155,11 +1163,11 @@ impl App {
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if d.size_bytes >= self.min_size => Some(d.clone()),
+                Row::Done(d) if d.bytes(SizeMode::Freeable) >= self.min_size => Some(d.clone()),
                 _ => None,
             })
             .collect();
-        scanner::sort_by_size(&mut done);
+        scanner::sort_by_size(&mut done, SizeMode::Freeable);
         if self.top > 0 && done.len() > self.top {
             done.truncate(self.top);
         }
@@ -1412,7 +1420,7 @@ impl App {
         let max_size = items
             .iter()
             .filter_map(|it| match it {
-                DisplayItem::Data(Row::Done(d)) => Some(d.size_bytes),
+                DisplayItem::Data(Row::Done(d)) => Some(d.bytes(SizeMode::Freeable)),
                 _ => None,
             })
             .max()
@@ -1526,7 +1534,7 @@ impl App {
             }
             DisplayItem::Data(Row::Done(d)) => {
                 let frac = if max_size > 0 {
-                    d.size_bytes as f64 / max_size as f64
+                    d.bytes(SizeMode::Freeable) as f64 / max_size as f64
                 } else {
                     0.0
                 };
@@ -1536,8 +1544,10 @@ impl App {
                 let mark = if marked { "✓" } else { " " };
                 let row = TableRow::new(vec![
                     Cell::from(mark).style(Style::new().fg(SELECT_FG).bold()),
-                    Cell::from(Text::from(self.fmt_size(d.size_bytes)).right_aligned())
-                        .style(Style::new().fg(color).bold()),
+                    Cell::from(
+                        Text::from(self.fmt_size(d.bytes(SizeMode::Freeable))).right_aligned(),
+                    )
+                    .style(Style::new().fg(color).bold()),
                     Cell::from(build_bar(frac, bar_width)).style(Style::new().fg(color)),
                     Cell::from(Text::from(group_thousands(d.file_count)).right_aligned())
                         .style(Style::new().fg(Color::Gray)),
@@ -1586,7 +1596,7 @@ impl App {
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if self.passes(d, now) => Some(d.size_bytes),
+                Row::Done(d) if self.passes(d, now) => Some(d.bytes(SizeMode::Freeable)),
                 _ => None,
             })
             .sum();
@@ -2031,7 +2041,7 @@ fn now() -> SystemTime {
 fn group_total(rows: &[&Row]) -> u64 {
     rows.iter()
         .filter_map(|r| match r {
-            Row::Done(d) => Some(d.size_bytes),
+            Row::Done(d) => Some(d.bytes(SizeMode::Freeable)),
             _ => None,
         })
         .sum()
@@ -2133,6 +2143,7 @@ fn age_color(modified: Option<SystemTime>) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::DirKind;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2275,7 +2286,9 @@ mod tests {
             path: PathBuf::from("/tmp/c"),
             ecosystem: "Node.js",
             name: "node_modules",
-            size_bytes: 42,
+            kind: DirKind::Dependency,
+            allocated_bytes: 42,
+            freeable_bytes: 42,
             file_count: 3,
             modified: None,
         };
@@ -2290,7 +2303,7 @@ mod tests {
             .find(|r| r.path() == Path::new("/tmp/c"))
             .expect("c row present");
         match c {
-            Row::Done(d) => assert_eq!(d.size_bytes, 42),
+            Row::Done(d) => assert_eq!(d.freeable_bytes, 42),
             Row::Pending { .. } => panic!("c should be sized"),
         }
         assert!(matches!(
@@ -2321,7 +2334,9 @@ mod tests {
             path: PathBuf::from(format!("/tmp/{name}")),
             ecosystem: eco,
             name,
-            size_bytes: size,
+            kind: DirKind::Dependency,
+            allocated_bytes: size,
+            freeable_bytes: size,
             file_count: 1,
             modified: None,
         })
@@ -2459,7 +2474,9 @@ mod tests {
             path: victim.clone(),
             ecosystem: "Node.js",
             name: "node_modules",
-            size_bytes: 5,
+            kind: DirKind::Dependency,
+            allocated_bytes: 5,
+            freeable_bytes: 5,
             file_count: 1,
             modified: None,
         }));

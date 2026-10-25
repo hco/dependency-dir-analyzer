@@ -6,12 +6,14 @@ use humansize::{format_size, DECIMAL};
 use serde::Serialize;
 
 use crate::scanner::{rfc3339_utc, unix_seconds, DependencyDir};
+use crate::state::SizeMode;
 
 /// The full result of a scan, suitable for serialization.
 #[derive(Debug, Serialize)]
 pub struct Report<'a> {
     pub root: String,
-    pub total_size_bytes: u64,
+    pub total_allocated_bytes: u64,
+    pub total_freeable_bytes: u64,
     pub total_file_count: u64,
     pub directory_count: usize,
     pub directories: &'a [DependencyDir],
@@ -19,11 +21,13 @@ pub struct Report<'a> {
 
 impl<'a> Report<'a> {
     pub fn new(root: &str, directories: &'a [DependencyDir]) -> Self {
-        let total_size_bytes = directories.iter().map(|d| d.size_bytes).sum();
+        let total_allocated_bytes = directories.iter().map(|d| d.allocated_bytes).sum();
+        let total_freeable_bytes = directories.iter().map(|d| d.freeable_bytes).sum();
         let total_file_count = directories.iter().map(|d| d.file_count).sum();
         Report {
             root: root.to_string(),
-            total_size_bytes,
+            total_allocated_bytes,
+            total_freeable_bytes,
             total_file_count,
             directory_count: directories.len(),
             directories,
@@ -112,7 +116,9 @@ pub fn write_csv(w: &mut impl Write, report: &Report) -> Result<()> {
         "path",
         "ecosystem",
         "name",
-        "size_bytes",
+        "kind",
+        "allocated_bytes",
+        "freeable_bytes",
         "file_count",
         "modified_unix",
         "modified_rfc3339",
@@ -127,7 +133,9 @@ pub fn write_csv(w: &mut impl Write, report: &Report) -> Result<()> {
             &d.path.display().to_string(),
             d.ecosystem,
             d.name,
-            &d.size_bytes.to_string(),
+            d.kind.as_str(),
+            &d.allocated_bytes.to_string(),
+            &d.freeable_bytes.to_string(),
             &d.file_count.to_string(),
             &unix,
             &rfc,
@@ -137,8 +145,13 @@ pub fn write_csv(w: &mut impl Write, report: &Report) -> Result<()> {
     Ok(())
 }
 
-/// Write the report as an aligned, human-readable table.
-pub fn write_table(w: &mut impl Write, report: &Report, show_summary: bool) -> Result<()> {
+/// Write the report as an aligned, human-readable table, sized by `mode`.
+pub fn write_table(
+    w: &mut impl Write,
+    report: &Report,
+    show_summary: bool,
+    mode: SizeMode,
+) -> Result<()> {
     if report.directories.is_empty() {
         writeln!(w, "No dependency directories found under {}.", report.root)?;
         return Ok(());
@@ -148,7 +161,7 @@ pub fn write_table(w: &mut impl Write, report: &Report, show_summary: bool) -> R
     let sizes: Vec<String> = report
         .directories
         .iter()
-        .map(|d| human_size(d.size_bytes))
+        .map(|d| human_size(d.bytes(mode)))
         .collect();
     let ages: Vec<String> = report
         .directories
@@ -176,18 +189,24 @@ pub fn write_table(w: &mut impl Write, report: &Report, show_summary: bool) -> R
     }
 
     if show_summary {
-        let total = human_size(report.total_size_bytes);
+        let freeable = format!("{} freeable", human_size(report.total_freeable_bytes));
+        let on_disk = format!("{} on disk", human_size(report.total_allocated_bytes));
+        let (shown, other) = match mode {
+            SizeMode::Freeable => (freeable, on_disk),
+            SizeMode::Allocated => (on_disk, freeable),
+        };
         writeln!(w)?;
         writeln!(
             w,
-            "{} across {} director{} ({} files)",
-            total,
+            "{} across {} director{} ({}, {} files)",
+            shown,
             report.directory_count,
             if report.directory_count == 1 {
                 "y"
             } else {
                 "ies"
             },
+            other,
             report.total_file_count,
         )?;
     }
@@ -197,10 +216,10 @@ pub fn write_table(w: &mut impl Write, report: &Report, show_summary: bool) -> R
 
 /// Convenience helper that writes to stdout, ignoring broken-pipe errors (so
 /// piping into `head` and friends doesn't print a scary error).
-pub fn print_table(report: &Report, show_summary: bool) -> Result<()> {
+pub fn print_table(report: &Report, show_summary: bool, mode: SizeMode) -> Result<()> {
     let stdout = io::stdout();
     let mut lock = stdout.lock();
-    match write_table(&mut lock, report, show_summary) {
+    match write_table(&mut lock, report, show_summary, mode) {
         Err(e) if is_broken_pipe(&e) => Ok(()),
         other => other,
     }
@@ -241,6 +260,7 @@ fn is_broken_pipe(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scanner::DirKind;
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -250,7 +270,9 @@ mod tests {
                 path: PathBuf::from("./a/node_modules"),
                 ecosystem: "Node.js",
                 name: "node_modules",
-                size_bytes: 2_000_000,
+                kind: DirKind::Dependency,
+                allocated_bytes: 2_000_000,
+                freeable_bytes: 300_000,
                 file_count: 10,
                 modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
             },
@@ -258,7 +280,9 @@ mod tests {
                 path: PathBuf::from("./b/target"),
                 ecosystem: "Rust / Maven",
                 name: "target",
-                size_bytes: 500_000,
+                kind: DirKind::Dependency,
+                allocated_bytes: 500_000,
+                freeable_bytes: 500_000,
                 file_count: 4,
                 modified: None,
             },
@@ -269,7 +293,8 @@ mod tests {
     fn report_totals_are_summed() {
         let dirs = sample();
         let report = Report::new(".", &dirs);
-        assert_eq!(report.total_size_bytes, 2_500_000);
+        assert_eq!(report.total_allocated_bytes, 2_500_000);
+        assert_eq!(report.total_freeable_bytes, 800_000);
         assert_eq!(report.total_file_count, 14);
         assert_eq!(report.directory_count, 2);
     }
@@ -279,11 +304,24 @@ mod tests {
         let dirs = sample();
         let report = Report::new(".", &dirs);
         let mut buf = Vec::new();
-        write_table(&mut buf, &report, true).unwrap();
+        write_table(&mut buf, &report, true, SizeMode::Freeable).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("node_modules"));
         assert!(out.contains("target"));
-        assert!(out.contains("across 2 directories"));
+        assert!(out.contains("300 kB"));
+        assert!(out.contains("800 kB freeable across 2 directories (2.50 MB on disk, 14 files)"));
+    }
+
+    #[test]
+    fn table_shows_on_disk_sizes_in_allocated_mode() {
+        let dirs = sample();
+        let report = Report::new(".", &dirs);
+        let mut buf = Vec::new();
+        write_table(&mut buf, &report, true, SizeMode::Allocated).unwrap();
+        let out = String::from_utf8(buf).unwrap();
+        assert!(out.contains("2 MB"));
+        assert!(!out.contains("300 kB"));
+        assert!(out.contains("2.50 MB on disk across 2 directories (800 kB freeable, 14 files)"));
     }
 
     #[test]
@@ -291,7 +329,7 @@ mod tests {
         let dirs: Vec<DependencyDir> = Vec::new();
         let report = Report::new("/tmp", &dirs);
         let mut buf = Vec::new();
-        write_table(&mut buf, &report, true).unwrap();
+        write_table(&mut buf, &report, true, SizeMode::Freeable).unwrap();
         let out = String::from_utf8(buf).unwrap();
         assert!(out.contains("No dependency directories found"));
     }
@@ -304,7 +342,11 @@ mod tests {
         write_json(&mut buf, &report).unwrap();
         let value: serde_json::Value = serde_json::from_slice(&buf).unwrap();
         assert_eq!(value["directory_count"], 2);
-        assert_eq!(value["total_size_bytes"], 2_500_000);
+        assert_eq!(value["total_allocated_bytes"], 2_500_000);
+        assert_eq!(value["total_freeable_bytes"], 800_000);
+        assert_eq!(value["directories"][0]["freeable_bytes"], 300_000);
+        assert_eq!(value["directories"][0]["allocated_bytes"], 2_000_000);
+        assert_eq!(value["directories"][0]["kind"], "dependency");
         // The first directory carries a structured timestamp, the second null.
         assert_eq!(
             value["directories"][0]["modified"]["unix"],
@@ -323,13 +365,12 @@ mod tests {
         let mut lines = out.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "path,ecosystem,name,size_bytes,file_count,modified_unix,modified_rfc3339"
+            "path,ecosystem,name,kind,allocated_bytes,freeable_bytes,file_count,modified_unix,modified_rfc3339"
         );
-        assert!(out.contains("node_modules"));
-        assert!(out.contains("2000000"));
+        assert!(out.contains("node_modules,dependency,2000000,300000,10,"));
         // The directory with no timestamp leaves the two trailing time columns
         // empty.
-        assert!(out.contains("500000,4,,"));
+        assert!(out.contains("500000,500000,4,,"));
     }
 
     #[test]

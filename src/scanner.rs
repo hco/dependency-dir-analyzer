@@ -8,8 +8,31 @@ use rayon::prelude::*;
 use serde::Serialize;
 use walkdir::WalkDir;
 
+use crate::state::SizeMode;
+use crate::usage::{file_info, Usage, UsageAccumulator};
+
+/// What a reported directory is, which decides how it is cleaned up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DirKind {
+    /// A regenerable dependency/build directory found by name.
+    Dependency,
+    /// A pnpm content-addressable store shared by projects.
+    PnpmStore,
+}
+
+impl DirKind {
+    /// The same snake_case name serde uses, for the CSV column.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DirKind::Dependency => "dependency",
+            DirKind::PnpmStore => "pnpm_store",
+        }
+    }
+}
+
 /// A dependency directory that was found during a scan, together with its
-/// total on-disk size and the most recent modification time beneath it.
+/// size and the most recent modification time beneath it.
 #[derive(Debug, Clone, Serialize)]
 pub struct DependencyDir {
     /// Absolute or relative path to the directory, depending on the scan root.
@@ -18,8 +41,13 @@ pub struct DependencyDir {
     pub ecosystem: &'static str,
     /// The directory's base name that matched a known pattern (e.g. `node_modules`).
     pub name: &'static str,
-    /// Total size of all regular files contained in the directory, in bytes.
-    pub size_bytes: u64,
+    pub kind: DirKind,
+    /// Bytes allocated on disk for the files beneath it, like `du`: hardlinked
+    /// inodes count once.
+    pub allocated_bytes: u64,
+    /// Bytes deleting the directory would give back: what is not shared with
+    /// anything outside it via hardlinks or APFS clones.
+    pub freeable_bytes: u64,
     /// Number of regular files contained in the directory.
     pub file_count: u64,
     /// Most recent modification time found within the directory (the directory
@@ -51,6 +79,22 @@ where
 /// Convert a `SystemTime` to whole seconds since the Unix epoch (may be
 /// negative for pre-1970 timestamps). Returns `None` only if the value is wildly
 /// out of range.
+impl DependencyDir {
+    /// The byte count `mode` refers to.
+    pub fn bytes(&self, mode: SizeMode) -> u64 {
+        match mode {
+            SizeMode::Freeable => self.freeable_bytes,
+            SizeMode::Allocated => self.allocated_bytes,
+        }
+    }
+
+    /// Whether most of the directory is shared with something outside it, so
+    /// deleting it frees little of what it occupies.
+    pub fn mostly_shared(&self) -> bool {
+        self.allocated_bytes > 0 && self.freeable_bytes * 2 < self.allocated_bytes
+    }
+}
+
 pub fn unix_seconds(t: SystemTime) -> Option<i64> {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_secs()).ok(),
@@ -275,7 +319,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
         .map(|(path, pattern)| size_match(path, pattern, opts.follow_symlinks, &never))
         .collect();
 
-    sort_by_size(&mut results);
+    sort_by_size(&mut results, SizeMode::Freeable);
     results
 }
 
@@ -329,35 +373,40 @@ fn size_match(
     follow_symlinks: bool,
     cancel: &AtomicBool,
 ) -> DependencyDir {
-    let (size_bytes, file_count, modified) = directory_stats(&path, follow_symlinks, cancel);
+    let (usage, file_count, modified) = directory_stats(&path, follow_symlinks, cancel);
     DependencyDir {
         path,
         ecosystem: pattern.ecosystem,
         name: pattern.name,
-        size_bytes,
+        kind: DirKind::Dependency,
+        allocated_bytes: usage.allocated,
+        freeable_bytes: usage.freeable,
         file_count,
         modified,
     }
 }
 
-/// Sort dependency directories largest-first, breaking ties by path for stable
-/// output.
-pub fn sort_by_size(results: &mut [DependencyDir]) {
+/// Sort dependency directories largest-first by the byte count `mode` refers
+/// to, breaking ties by path for stable output.
+pub fn sort_by_size(results: &mut [DependencyDir], mode: SizeMode) {
     results.sort_by(|a, b| {
-        b.size_bytes
-            .cmp(&a.size_bytes)
+        b.bytes(mode)
+            .cmp(&a.bytes(mode))
             .then_with(|| a.path.cmp(&b.path))
     });
 }
 
-/// Sum the size and count of all regular files within `dir`, and find the most
-/// recent modification time of the directory and everything beneath it.
+/// Measure the allocated and freeable bytes and count of all regular files
+/// within `dir`, and find the most recent modification time of the directory
+/// and everything beneath it.
 fn directory_stats(
     dir: &Path,
     follow_symlinks: bool,
     cancel: &AtomicBool,
-) -> (u64, u64, Option<SystemTime>) {
-    let mut total = 0u64;
+) -> (Usage, u64, Option<SystemTime>) {
+    // Following symlinks can reach the same inode by several paths, so every
+    // inode must be counted once, not only hardlinked ones.
+    let mut usage = UsageAccumulator::new(follow_symlinks);
     let mut count = 0u64;
     let mut newest: Option<SystemTime> = None;
 
@@ -373,7 +422,7 @@ fn directory_stats(
         };
         if let Ok(meta) = entry.metadata() {
             if entry.file_type().is_file() {
-                total += meta.len();
+                usage.add(file_info(entry.path(), &meta));
                 count += 1;
             }
             if let Ok(modified) = meta.modified() {
@@ -385,7 +434,7 @@ fn directory_stats(
         }
     }
 
-    (total, count, newest)
+    (usage.finish(), count, newest)
 }
 
 #[cfg(test)]
@@ -423,8 +472,11 @@ mod tests {
         let results = scan(&tmp, &ScanOptions::default());
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].name, "node_modules");
-        // 5 bytes + 7 bytes from both files are summed into the single match.
-        assert_eq!(results[0].size_bytes, 12);
+        assert_eq!(results[0].kind, DirKind::Dependency);
+        // Both files (5 + 7 bytes) are sized into the single match: at least a
+        // block each on disk, all of it freeable since nothing is shared.
+        assert!(results[0].allocated_bytes >= 12);
+        assert_eq!(results[0].freeable_bytes, results[0].allocated_bytes);
         assert_eq!(results[0].file_count, 2);
         assert!(results[0].modified.is_some());
 
@@ -453,9 +505,51 @@ mod tests {
         }
         assert_eq!(discovered, 1);
         assert_eq!(sized.len(), 1);
-        assert_eq!(sized[0].size_bytes, 12);
+        assert!(sized[0].allocated_bytes >= 12);
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hardlinked_twin_dirs_are_not_freeable() {
+        // Two projects whose node_modules share one file via a hardlink, as
+        // pnpm does on Linux: deleting either alone frees nothing.
+        let tmp = std::env::temp_dir().join(format!("dda-test-{}-twins", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let a = tmp.join("a").join("node_modules");
+        let b = tmp.join("b").join("node_modules");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        fs::write(a.join("lib.js"), vec![1u8; 64 * 1024]).unwrap();
+        fs::hard_link(a.join("lib.js"), b.join("lib.js")).unwrap();
+
+        let results = scan(&tmp, &ScanOptions::default());
+        assert_eq!(results.len(), 2);
+        for dir in &results {
+            assert!(dir.allocated_bytes >= 64 * 1024, "{dir:?}");
+            assert_eq!(dir.freeable_bytes, 0, "{dir:?}");
+            assert!(dir.mostly_shared());
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn bytes_follow_the_size_mode() {
+        let dir = DependencyDir {
+            path: PathBuf::from("/x/node_modules"),
+            ecosystem: "Node.js",
+            name: "node_modules",
+            kind: DirKind::Dependency,
+            allocated_bytes: 1000,
+            freeable_bytes: 600,
+            file_count: 1,
+            modified: None,
+        };
+        assert_eq!(dir.bytes(SizeMode::Freeable), 600);
+        assert_eq!(dir.bytes(SizeMode::Allocated), 1000);
+        assert!(!dir.mostly_shared());
     }
 
     #[test]

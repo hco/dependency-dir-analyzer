@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 
-use crate::state::IconStyle;
+use crate::state::{IconStyle, SizeMode};
 
 /// Scan a directory tree for dependency directories and report how much space
 /// they use.
@@ -45,6 +45,13 @@ pub struct Cli {
     /// Overrides the remembered setting for this run; toggle live with `i`.
     #[arg(long, value_enum, value_name = "STYLE")]
     pub icons: Option<IconStyle>,
+
+    /// Which size to show and sort by: `freeable` (what deleting would give
+    /// back, the default) or `allocated` (on disk, like `du`). Overrides the
+    /// remembered setting for this run; toggle live with `f`. JSON and CSV
+    /// always contain both.
+    #[arg(long, value_enum, value_name = "MODE")]
+    pub size_mode: Option<SizeMode>,
 
     /// Print a plain static table instead of the interactive TUI, even on a
     /// terminal.
