@@ -1,6 +1,6 @@
 [package]
 name = "dependency-dir-analyzer"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.74"
 description = "Scan a directory tree for dependency directories (node_modules, target, .venv, …) and report how much space they use."
