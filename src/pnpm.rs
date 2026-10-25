@@ -2,6 +2,7 @@
 //! space they hold shows up as rows of their own.
 
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 /// Ecosystem label (and row name) for pnpm store rows.
 pub const STORE_ECOSYSTEM: &str = "pnpm store";
@@ -55,6 +56,112 @@ pub fn default_store_dirs() -> Vec<PathBuf> {
         .collect();
     dirs.sort();
     dirs
+}
+
+/// The pnpm major version whose store layout `store` is, read from its
+/// `v<N>` directory name. pnpm 7 to 9 shared the `v3` layout, so that maps to 9.
+pub fn store_major(store: &Path) -> Option<u32> {
+    let name = store.file_name()?.to_str()?;
+    if !is_version_dir(name) {
+        return None;
+    }
+    match name[1..].parse::<u32>().ok()? {
+        3 => Some(9),
+        n if n >= 10 => Some(n),
+        _ => None,
+    }
+}
+
+/// Whether a pnpm of major version `installed` reads the store layout that
+/// pnpm `store_major` writes.
+fn reads_layout(installed: u32, store_major: u32) -> bool {
+    installed == store_major || (store_major == 9 && (7..=9).contains(&installed))
+}
+
+/// The command that prunes `store`: the installed pnpm if it reads that
+/// store's layout, otherwise the matching pnpm via `npx`, since a pnpm of
+/// another version would look in a different `v<N>` directory.
+pub fn prune_command(store: &Path, installed_major: Option<u32>) -> (String, Vec<String>) {
+    let major = store_major(store);
+    // `--store-dir` takes the store root; pnpm appends its own `v<N>`.
+    let store_dir = match major {
+        Some(_) => store.parent().unwrap_or(store),
+        None => store,
+    };
+    let mut args: Vec<String> = Vec::new();
+    let program = match (major, installed_major) {
+        (Some(m), Some(i)) if reads_layout(i, m) => "pnpm",
+        (None, _) => "pnpm",
+        (Some(m), _) => {
+            args.push("--yes".to_string());
+            args.push(format!("pnpm@{m}"));
+            "npx"
+        }
+    };
+    args.extend(["store", "prune", "--store-dir"].map(String::from));
+    args.push(store_dir.display().to_string());
+    (program.to_string(), args)
+}
+
+/// Run `pnpm store prune` on `store`, removing packages no project references
+/// anymore. On failure the error names the command so it can be run by hand.
+pub fn prune(store: &Path) -> Result<(), String> {
+    let (program, args) = prune_command(store, installed_major());
+    let manual = shell_line(&program, &args);
+    if !store.is_dir() {
+        return Err(format!("store not found; run manually: {manual}"));
+    }
+    let output = Command::new(&program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("could not start {program}: {e}; run manually: {manual}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let reason = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(str::trim)
+        .unwrap_or("pnpm store prune failed");
+    Err(format!("{reason}; run manually: {manual}"))
+}
+
+/// Major version of the pnpm on `PATH`, if there is one.
+fn installed_major() -> Option<u32> {
+    let output = Command::new("pnpm")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// A command line to copy into a shell, quoting arguments that need it.
+fn shell_line(program: &str, args: &[String]) -> String {
+    let mut line = program.to_string();
+    for arg in args {
+        line.push(' ');
+        if arg
+            .chars()
+            .any(|c| c.is_whitespace() || "'\"$`\\".contains(c))
+        {
+            line.push_str(&format!("'{}'", arg.replace('\'', r"'\''")));
+        } else {
+            line.push_str(arg);
+        }
+    }
+    line
 }
 
 /// Whether `name` looks like a store layout version directory (`v10`).
@@ -133,6 +240,77 @@ mod tests {
         assert_eq!(parse_store_dir("layoutVersion: 5\n", Path::new("/p")), None);
         assert_eq!(parse_store_dir("storeDir:\n", Path::new("/p")), None);
         assert_eq!(parse_store_dir("\u{0}\u{1}garbage", Path::new("/p")), None);
+    }
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn store_major_maps_layout_to_pnpm_version() {
+        assert_eq!(store_major(Path::new("/s/store/v10")), Some(10));
+        assert_eq!(store_major(Path::new("/s/store/v11")), Some(11));
+        // pnpm 7 to 9 all wrote the v3 layout.
+        assert_eq!(store_major(Path::new("/s/store/v3")), Some(9));
+        assert_eq!(store_major(Path::new("/x/custom")), None);
+    }
+
+    #[test]
+    fn prune_command_uses_matching_pnpm() {
+        let store = Path::new("/s/store/v10");
+        assert_eq!(
+            prune_command(store, Some(10)),
+            (
+                "pnpm".to_string(),
+                args(&["store", "prune", "--store-dir", "/s/store"])
+            )
+        );
+        assert_eq!(
+            prune_command(store, Some(11)),
+            (
+                "npx".to_string(),
+                args(&[
+                    "--yes",
+                    "pnpm@10",
+                    "store",
+                    "prune",
+                    "--store-dir",
+                    "/s/store"
+                ])
+            )
+        );
+        assert_eq!(
+            prune_command(store, None),
+            (
+                "npx".to_string(),
+                args(&[
+                    "--yes",
+                    "pnpm@10",
+                    "store",
+                    "prune",
+                    "--store-dir",
+                    "/s/store"
+                ])
+            )
+        );
+        // pnpm 8 still reads the v3 layout, so no download is needed.
+        assert_eq!(prune_command(Path::new("/s/store/v3"), Some(8)).0, "pnpm");
+        assert_eq!(
+            prune_command(Path::new("/x/custom"), Some(10)),
+            (
+                "pnpm".to_string(),
+                args(&["store", "prune", "--store-dir", "/x/custom"])
+            )
+        );
+    }
+
+    #[test]
+    fn prune_failure_names_the_command_to_run() {
+        let err = prune(Path::new("/definitely/not/a/store/v10")).unwrap_err();
+        assert!(
+            err.contains("store prune --store-dir /definitely/not/a/store"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -34,10 +34,12 @@ use ratatui::widgets::{
 };
 use ratatui::DefaultTerminal;
 
+use crate::pnpm;
 use crate::report::{group_thousands, human_size, megabytes_size, relative_age};
+use crate::scanner::DirKind;
 use crate::scanner::{self, DependencyDir, ScanEvent, ScanOptions};
 use crate::state::{
-    self, AgeFilter, IconStyle, SizeFilter, SizeMode, SizeUnit, SortKey, ViewState,
+    self, AgeFilter, IconStyle, SizeFilter, SizeMode, SizeUnit, SortKey, StoreAction, ViewState,
 };
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -102,7 +104,10 @@ pub fn run(
     }
     let mut app = App::new(root.to_path_buf(), top, min_size, view);
     app.mouse_enabled = mouse;
-    app.trash_notice_pending = !state::settings().trash_removal_acknowledged;
+    let settings = state::settings();
+    app.trash_notice_pending = !settings.trash_removal_acknowledged;
+    app.store_action = settings.store_action;
+    app.follow_symlinks = opts.follow_symlinks;
     app.snapshots = crate::usage::has_local_snapshots();
     let result = app.event_loop(&mut terminal, rx);
     if mouse {
@@ -120,6 +125,12 @@ pub fn run(
     // Remember the current view for next time (best-effort; only on clean exit).
     if result.is_ok() {
         state::save(root, &app.view_state());
+        // The store action is a machine-wide choice, saved with the settings.
+        let mut settings = state::settings();
+        if settings.store_action != app.store_action {
+            settings.store_action = app.store_action;
+            state::save_settings(&settings);
+        }
     }
 
     result.map(|()| app.final_results())
@@ -168,8 +179,21 @@ enum Overlay {
 /// The result of trying to remove one directory, sent back from the worker
 /// thread as it goes so the UI can update without blocking.
 enum DeleteOutcome {
-    Removed { path: PathBuf, size: u64 },
-    Failed { path: PathBuf, error: String },
+    Removed {
+        path: PathBuf,
+        size: u64,
+    },
+    /// A pnpm store was pruned in place; `new` is it re-measured afterwards.
+    Pruned {
+        old: DependencyDir,
+        new: DependencyDir,
+    },
+    Failed {
+        path: PathBuf,
+        /// What was attempted (`delete` or `prune`), for the warning.
+        verb: &'static str,
+        error: String,
+    },
 }
 
 /// Live state of an in-flight deletion, driving the progress modal.
@@ -178,6 +202,8 @@ struct DeleteProgress {
     total: usize,
     reclaimed: u64,
     failures: usize,
+    /// How many of `done` were stores pruned rather than removed.
+    pruned: usize,
 }
 
 /// One rendered line of the table: an ecosystem group header (only when
@@ -210,6 +236,7 @@ enum ClickAction {
     CycleUnit,
     CycleIcons,
     ToggleSizeMode,
+    ToggleStoreAction,
     // Ecosystem overlay.
     EcoToggle(usize),
     EcoAllNone,
@@ -335,6 +362,12 @@ struct App {
     /// Whether local Time Machine snapshots exist, which keep deleted data
     /// on disk until they expire. Defaults to `false`; [`run`] sets it.
     snapshots: bool,
+    /// What deleting a marked pnpm store does. Remembered globally; [`run`]
+    /// loads it from the settings.
+    store_action: StoreAction,
+    /// Whether the scan follows symlinks, so a pruned store is re-measured
+    /// the same way it was measured.
+    follow_symlinks: bool,
 }
 
 impl App {
@@ -369,6 +402,8 @@ impl App {
             mouse_enabled: true,
             trash_notice_pending: false,
             snapshots: false,
+            store_action: StoreAction::default(),
+            follow_symlinks: false,
         }
     }
 
@@ -535,6 +570,7 @@ impl App {
             KeyCode::Char('u') => self.size_unit = self.size_unit.toggle(),
             KeyCode::Char('i') => self.icon_style = self.icon_style.cycle(),
             KeyCode::Char('f') => self.size_mode = self.size_mode.toggle(),
+            KeyCode::Char('p') => self.store_action = self.store_action.toggle(),
             KeyCode::Char('g') => self.group = !self.group,
             KeyCode::Char('s') => self.size_filter = self.size_filter.next(),
             KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
@@ -561,6 +597,7 @@ impl App {
     fn handle_confirm_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_deletion(),
+            KeyCode::Char('p') => self.store_action = self.store_action.toggle(),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = Overlay::None;
             }
@@ -682,10 +719,13 @@ impl App {
                     | CycleUnit
                     | CycleIcons
                     | ToggleSizeMode
+                    | ToggleStoreAction
             ),
             Overlay::Ecosystems { .. } => matches!(action, EcoToggle(_) | EcoAllNone),
             Overlay::TrashRemovedNotice => matches!(action, NoticeContinue | ConfirmCancel),
-            Overlay::ConfirmDelete => matches!(action, ConfirmYes | ConfirmCancel),
+            Overlay::ConfirmDelete => {
+                matches!(action, ConfirmYes | ConfirmCancel | ToggleStoreAction)
+            }
             Overlay::Help => false,
         }
     }
@@ -702,6 +742,7 @@ impl App {
             ClickAction::CycleUnit => self.size_unit = self.size_unit.toggle(),
             ClickAction::CycleIcons => self.icon_style = self.icon_style.cycle(),
             ClickAction::ToggleSizeMode => self.size_mode = self.size_mode.toggle(),
+            ClickAction::ToggleStoreAction => self.store_action = self.store_action.toggle(),
             ClickAction::EcoToggle(i) => self.toggle_eco_at(i),
             ClickAction::EcoAllNone => self.toggle_all_ecos(),
             ClickAction::NoticeContinue => self.overlay = Overlay::ConfirmDelete,
@@ -934,29 +975,51 @@ impl App {
     /// inline would freeze the UI — while `drain_deletion` applies the streamed
     /// results each tick.
     fn start_deletion(&mut self) {
-        let targets = self.selected_dirs();
+        let mut targets: Vec<DependencyDir> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Done(d) if self.selected.contains(&d.path) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
         if targets.is_empty() {
             return;
         }
+        // Projects go first: pruning a store afterwards also drops the
+        // packages only those just-deleted projects were holding on to.
+        targets.sort_by_key(|d| d.kind == DirKind::PnpmStore);
+        let store_action = self.store_action;
+        let follow = self.follow_symlinks;
         self.action = None;
         self.delete_progress = Some(DeleteProgress {
             done: 0,
             total: targets.len(),
             reclaimed: 0,
             failures: 0,
+            pruned: 0,
         });
 
         let (tx, rx) = mpsc::channel();
         self.delete_rx = Some(rx);
         thread::spawn(move || {
-            for (path, size) in targets {
-                let outcome = match std::fs::remove_dir_all(&path) {
-                    Ok(()) => DeleteOutcome::Removed { path, size },
-                    Err(e) => DeleteOutcome::Failed {
-                        path,
-                        error: e.to_string(),
-                    },
-                };
+            for dir in targets {
+                let outcome =
+                    if dir.kind == DirKind::PnpmStore && store_action == StoreAction::Prune {
+                        prune_store(dir, follow)
+                    } else {
+                        match std::fs::remove_dir_all(&dir.path) {
+                            Ok(()) => DeleteOutcome::Removed {
+                                size: dir.freeable_bytes,
+                                path: dir.path,
+                            },
+                            Err(e) => DeleteOutcome::Failed {
+                                path: dir.path,
+                                verb: "delete",
+                                error: e.to_string(),
+                            },
+                        }
+                    };
                 // The UI hung up (quit): stop early, nothing left to report to.
                 if tx.send(outcome).is_err() {
                     break;
@@ -973,28 +1036,45 @@ impl App {
                 return;
             };
             match rx.try_recv() {
-                Ok(DeleteOutcome::Removed { path, size }) => {
-                    self.remove_rows(std::slice::from_ref(&path));
-                    self.selected.remove(&path);
-                    if let Some(p) = &mut self.delete_progress {
-                        p.done += 1;
-                        p.reclaimed += size;
-                    }
-                }
-                Ok(DeleteOutcome::Failed { path, error }) => {
-                    self.warnings += 1;
-                    self.last_warning =
-                        Some(format!("failed to delete {}: {error}", path.display()));
-                    self.selected.remove(&path);
-                    if let Some(p) = &mut self.delete_progress {
-                        p.done += 1;
-                        p.failures += 1;
-                    }
-                }
+                Ok(outcome) => self.apply_delete_outcome(outcome),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     self.finish_deletion();
                     return;
+                }
+            }
+        }
+    }
+
+    /// Apply one outcome streamed back from the deletion worker.
+    fn apply_delete_outcome(&mut self, outcome: DeleteOutcome) {
+        match outcome {
+            DeleteOutcome::Removed { path, size } => {
+                self.remove_rows(std::slice::from_ref(&path));
+                self.selected.remove(&path);
+                if let Some(p) = &mut self.delete_progress {
+                    p.done += 1;
+                    p.reclaimed += size;
+                }
+            }
+            DeleteOutcome::Pruned { old, new } => {
+                self.selected.remove(&old.path);
+                if let Some(p) = &mut self.delete_progress {
+                    p.done += 1;
+                    p.pruned += 1;
+                    p.reclaimed += old.allocated_bytes.saturating_sub(new.allocated_bytes);
+                }
+                if let Some(&i) = self.index.get(&old.path) {
+                    self.rows[i] = Row::Done(new);
+                }
+            }
+            DeleteOutcome::Failed { path, verb, error } => {
+                self.warnings += 1;
+                self.last_warning = Some(format!("failed to {verb} {}: {error}", path.display()));
+                self.selected.remove(&path);
+                if let Some(p) = &mut self.delete_progress {
+                    p.done += 1;
+                    p.failures += 1;
                 }
             }
         }
@@ -1007,20 +1087,43 @@ impl App {
         let Some(p) = self.delete_progress.take() else {
             return;
         };
-        let ok = p.done - p.failures;
-        self.action = Some(if p.failures == 0 {
-            format!(
-                "Deleted {ok} director{} · reclaimed {}",
-                if ok == 1 { "y" } else { "ies" },
-                self.fmt_size(p.reclaimed)
-            )
-        } else {
-            format!(
-                "Deleted {ok}, {} failed · reclaimed {} · see ⚠",
+        let removed = p.done - p.failures - p.pruned;
+        let mut done = Vec::new();
+        if removed > 0 || p.pruned == 0 {
+            done.push(format!(
+                "Deleted {removed} director{}",
+                if removed == 1 { "y" } else { "ies" }
+            ));
+        }
+        if p.pruned > 0 {
+            done.push(format!(
+                "pruned {} store{}",
+                p.pruned,
+                if p.pruned == 1 { "" } else { "s" }
+            ));
+        }
+        let mut msg = format!(
+            "{} · reclaimed {}",
+            done.join(", "),
+            self.fmt_size(p.reclaimed)
+        );
+        if p.failures > 0 {
+            // The last failure's text, so e.g. the prune command to run by
+            // hand is right there instead of only counted.
+            msg = format!(
+                "{msg} · {} failed: {}",
                 p.failures,
-                self.fmt_size(p.reclaimed)
-            )
-        });
+                self.last_warning.as_deref().unwrap_or("see ⚠")
+            );
+        }
+        self.action = Some(msg);
+    }
+
+    /// Whether any row (sized or not) is a pnpm store.
+    fn has_store_rows(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.ecosystem() == pnpm::STORE_ECOSYSTEM)
     }
 
     /// Drop the given paths from the row list (after they were deleted on disk).
@@ -1680,6 +1783,22 @@ impl App {
             )],
             ClickAction::CycleIcons,
         );
+        // Only worth a chip once there is a store to act on; then it is
+        // prominent, since one mode removes the whole store.
+        if self.has_store_rows() {
+            chips.text(Span::raw("  "));
+            let style = match self.store_action {
+                StoreAction::Prune => Style::new().fg(Color::Green),
+                StoreAction::Delete => Style::new().fg(Color::Red).bold(),
+            };
+            chips.button(
+                vec![Span::styled(
+                    format!("store:{}", self.store_action.label()),
+                    style,
+                )],
+                ClickAction::ToggleStoreAction,
+            );
+        }
         if self.warnings > 0 {
             chips.text(Span::raw("  "));
             chips.text(Span::styled(
@@ -1687,15 +1806,7 @@ impl App {
                 Style::new().fg(Color::Yellow),
             ));
         }
-        // The transient result of the last action (e.g. a deletion) trails the
-        // chips until the selection changes again.
-        if let Some(msg) = &self.action {
-            chips.text(Span::raw("   "));
-            chips.text(Span::styled(
-                msg.clone(),
-                Style::new().fg(Color::Green).italic(),
-            ));
-        }
+
         // The chips are the first inner footer line (below the top border).
         chips.register(&mut self.clicks, area.x + 1, area.y + 1);
 
@@ -1737,6 +1848,15 @@ impl App {
             ));
         }
 
+        // The transient result of the last action (e.g. a deletion) takes the
+        // view-hint line until the selection changes again, so a long one,
+        // such as a prune command to run by hand, stays readable.
+        if let Some(msg) = &self.action {
+            hints_view = Line::from(Span::styled(
+                msg.clone(),
+                Style::new().fg(Color::Green).italic(),
+            ));
+        }
         let text = Text::from(vec![chips.into_line(), hints_view, hints_action]);
         let para = Paragraph::new(text).block(
             Block::default()
@@ -1755,6 +1875,7 @@ impl App {
             help_line("S", "cycle sort (size · modified · name · files)"),
             help_line("f", "toggle size shown (freeable · on disk)"),
             help_line("u", "toggle size units (MB · auto)"),
+            help_line("p", "pnpm stores: prune (default) or delete whole"),
             help_line("i", "cycle ecosystem icons (emoji · nerd · off)"),
             help_line("g", "toggle grouping by ecosystem"),
             help_line("Enter / Space", "fold/unfold selected group"),
@@ -1910,14 +2031,36 @@ impl App {
             Style::new().fg(Color::White).bold(),
         )));
         lines.push(Line::raw(""));
+        let stores: HashSet<&Path> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Done(d) if d.kind == DirKind::PnpmStore => Some(d.path.as_path()),
+                _ => None,
+            })
+            .collect();
+        let any_store = dirs.iter().any(|(p, _)| stores.contains(p.as_path()));
         for (path, size) in dirs.iter().take(MAX_LISTED) {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {:>9}  ", self.fmt_size(*size)),
-                    Style::new().fg(Color::Gray),
-                ),
-                Span::styled(self.display_path(path), Style::new().fg(Color::White)),
-            ]));
+            let mut line = vec![Span::styled(
+                format!("  {:>9}  ", self.fmt_size(*size)),
+                Style::new().fg(Color::Gray),
+            )];
+            // Say what happens to a store before its (possibly cut off) path.
+            if stores.contains(path.as_path()) {
+                line.push(match self.store_action {
+                    StoreAction::Prune => {
+                        Span::styled("prune ", Style::new().fg(Color::Green).bold())
+                    }
+                    StoreAction::Delete => {
+                        Span::styled("DELETE whole store ", Style::new().fg(Color::Red).bold())
+                    }
+                });
+            }
+            line.push(Span::styled(
+                self.display_path(path),
+                Style::new().fg(Color::White),
+            ));
+            lines.push(Line::from(line));
         }
         if dirs.len() > MAX_LISTED {
             lines.push(Line::from(Span::styled(
@@ -1969,6 +2112,16 @@ impl App {
             ],
             ClickAction::ConfirmCancel,
         );
+        if any_store {
+            keys.text(Span::styled("    ", Style::new().fg(Color::Gray)));
+            keys.button(
+                vec![
+                    Span::styled("p ", Style::new().fg(Color::Green).bold()),
+                    Span::styled("prune/delete store", Style::new().fg(Color::Gray)),
+                ],
+                ClickAction::ToggleStoreAction,
+            );
+        }
 
         let keys_index = lines.len();
         let area = centered_rect(frame.area(), 70, (lines.len() + 1) as u16 + 2);
@@ -2084,6 +2237,29 @@ impl App {
     }
 }
 
+/// Prune a marked pnpm store and re-measure it, for the deletion worker.
+fn prune_store(old: DependencyDir, follow_symlinks: bool) -> DeleteOutcome {
+    match pnpm::prune(&old.path) {
+        Ok(()) => {
+            let never = AtomicBool::new(false);
+            let new = scanner::size_dir(
+                old.path.clone(),
+                DirKind::PnpmStore,
+                pnpm::STORE_ECOSYSTEM,
+                pnpm::STORE_ECOSYSTEM,
+                follow_symlinks,
+                &never,
+            );
+            DeleteOutcome::Pruned { old, new }
+        }
+        Err(error) => DeleteOutcome::Failed {
+            path: old.path,
+            verb: "prune",
+            error,
+        },
+    }
+}
+
 fn now() -> SystemTime {
     SystemTime::now()
 }
@@ -2195,7 +2371,6 @@ fn age_color(modified: Option<SystemTime>) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::scanner::DirKind;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
@@ -2537,6 +2712,154 @@ mod tests {
         assert!(!screen(&mut app, 140, 24).contains("Time Machine"));
         app.snapshots = true;
         assert!(screen(&mut app, 140, 24).contains("Time Machine snapshots"));
+    }
+
+    fn store_dir_row(path: PathBuf, allocated: u64, freeable: u64) -> DependencyDir {
+        DependencyDir {
+            path,
+            ecosystem: crate::pnpm::STORE_ECOSYSTEM,
+            name: crate::pnpm::STORE_ECOSYSTEM,
+            kind: DirKind::PnpmStore,
+            allocated_bytes: allocated,
+            freeable_bytes: freeable,
+            file_count: 1,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn store_chip_only_shows_with_store_rows() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        assert!(!screen(&mut app, 160, 24).contains("store:"));
+
+        app.rows.push(Row::Done(store_dir_row(
+            PathBuf::from("/s/store/v10"),
+            500,
+            200,
+        )));
+        assert!(screen(&mut app, 160, 24).contains("store:prune"));
+        let (rect, _) = app
+            .clicks
+            .iter()
+            .find(|(_, a)| matches!(a, ClickAction::ToggleStoreAction))
+            .copied()
+            .expect("store chip should register a click region");
+
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(app.store_action, StoreAction::Delete);
+        assert!(screen(&mut app, 160, 24).contains("store:delete"));
+
+        app.handle_click(rect.x, rect.y);
+        assert_eq!(app.store_action, StoreAction::Prune);
+    }
+
+    #[test]
+    fn confirm_dialog_names_store_action() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        let store = PathBuf::from("/s/store/v10");
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, 200)));
+        app.selected.insert(store);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::ConfirmDelete));
+
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("prune"), "{out}");
+        assert!(!out.contains("DELETE whole store"), "{out}");
+
+        // `p` flips the action from inside the dialog, too.
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::ConfirmDelete));
+        assert!(screen(&mut app, 140, 30).contains("DELETE whole store"));
+    }
+
+    #[test]
+    fn prune_failure_keeps_row_and_warns() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        let store = PathBuf::from("/s/store/v10");
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, 200)));
+        app.selected.insert(store.clone());
+        app.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total: 1,
+            reclaimed: 0,
+            failures: 0,
+            pruned: 0,
+        });
+
+        app.apply_delete_outcome(DeleteOutcome::Failed {
+            path: store.clone(),
+            verb: "prune",
+            error: "pnpm not found; run: pnpm store prune --store-dir /s/store".to_string(),
+        });
+        app.finish_deletion();
+
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.warnings, 1);
+        let action = app.action.clone().unwrap();
+        assert!(
+            action.contains("pnpm store prune --store-dir /s/store"),
+            "{action}"
+        );
+    }
+
+    #[test]
+    fn pruned_store_row_is_replaced_and_counts_reclaimed() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        let store = PathBuf::from("/s/store/v10");
+        let old = store_dir_row(store.clone(), 500, 200);
+        app.rows.push(Row::Done(old.clone()));
+        app.rebuild_index();
+        app.selected.insert(store.clone());
+        app.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total: 1,
+            reclaimed: 0,
+            failures: 0,
+            pruned: 0,
+        });
+
+        let new = store_dir_row(store.clone(), 320, 20);
+        app.apply_delete_outcome(DeleteOutcome::Pruned { old, new });
+
+        assert_eq!(app.delete_progress.as_ref().unwrap().reclaimed, 180);
+        assert!(app.selected.is_empty());
+        match &app.rows[0] {
+            Row::Done(d) => assert_eq!(d.allocated_bytes, 320),
+            Row::Pending { .. } => panic!("store row should stay sized"),
+        }
+    }
+
+    #[test]
+    fn delete_mode_removes_store_dir() {
+        let tmp = std::env::temp_dir().join(format!("dda-store-del-{}", std::process::id()));
+        let store = tmp.join("v10");
+        std::fs::create_dir_all(store.join("files")).unwrap();
+        std::fs::write(store.join("files").join("blob"), b"x").unwrap();
+
+        let mut app = App::new(tmp.clone(), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.store_action = StoreAction::Delete;
+        app.rows.push(Row::Done(store_dir_row(store.clone(), 1, 1)));
+        app.selected.insert(store.clone());
+
+        app.start_deletion();
+        for _ in 0..1000 {
+            app.drain_deletion();
+            if app.delete_progress.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.delete_progress.is_none(), "deletion did not finish");
+        assert!(!store.exists());
+        assert!(app.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
