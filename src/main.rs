@@ -3,6 +3,7 @@ mod report;
 mod scanner;
 mod state;
 mod tui;
+mod usage;
 
 use std::io::{self, IsTerminal};
 

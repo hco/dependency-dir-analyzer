@@ -31,6 +31,11 @@ serde_json = "1.0"
 time = { version = "0.3", features = ["formatting"] }
 walkdir = "2.5"
 
+# `getattrlist` for APFS clone detection (see `usage.rs`). Hardlinks and block
+# counts come from std's `MetadataExt`, so no other platform needs it.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.191"
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -43,3 +48,4 @@ strip = true
 # binaries dist ships are identical to a local release build. dist defaults
 # this to thin LTO for build speed, which this small crate doesn't need.
 inherits = "release"
+
