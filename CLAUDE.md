@@ -48,6 +48,8 @@ src/
   main.rs       # CLI entry point: parse args, pick TUI vs batch, dispatch output
   cli.rs        # clap argument definitions, `completions` subcommand, `parse_size`
   scanner.rs    # filesystem walk, patterns, parallel sizing, batch + streaming APIs
+  usage.rs      # per-file allocated bytes + hardlink/APFS-clone identity; freeable accounting
+  pnpm.rs       # pnpm store discovery (.modules.yaml, default location) and `pnpm store prune`
   report.rs     # Report struct + table/JSON/CSV rendering, size & age formatting
   tui.rs        # interactive live-updating ratatui UI (consumes the streaming scan)
   state.rs      # persisted TUI view prefs (sort/group/filters) keyed by scan root, plus global settings (e.g. mouse)
@@ -75,6 +77,15 @@ mise.toml       # toolchain + tasks
 - Sizing is parallelised across matches with `rayon`. While sizing a subtree the
   scanner also tracks the most recent mtime, which is what the "modified" column
   and the relative-age display ("3d ago") report.
+- Each row has two sizes (`usage.rs`): `allocated_bytes` (blocks on disk,
+  hardlinks once, like `du`) and `freeable_bytes` (what deleting it frees: a
+  hardlink or APFS clone counts only if every link/clone lies inside the row).
+  `SizeMode` picks which one the UI shows; deletion figures are always freeable.
+  Clone ids and refcounts come from `getattrlist` on macOS only.
+- `node_modules/.modules.yaml` names the pnpm store a project uses. Those
+  stores (plus pnpm's default location) become `DirKind::PnpmStore` rows,
+  deduplicated by canonical path and sized after all projects. Deleting one in
+  the TUI runs `pnpm store prune` by default (`StoreAction`).
 - There are two entry points: `scan` returns the full sorted `Vec` in one shot
   (used by the JSON/CSV/plain paths and tests), and `scan_streaming` sends
   `ScanEvent`s (`Discovered` → `Sized`) over a channel as it goes, which is what
