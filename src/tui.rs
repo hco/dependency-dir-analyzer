@@ -570,7 +570,9 @@ impl App {
             KeyCode::Char('u') => self.size_unit = self.size_unit.toggle(),
             KeyCode::Char('i') => self.icon_style = self.icon_style.cycle(),
             KeyCode::Char('f') => self.size_mode = self.size_mode.toggle(),
-            KeyCode::Char('p') => self.store_action = self.store_action.toggle(),
+            KeyCode::Char('p') if self.has_store_rows() => {
+                self.store_action = self.store_action.toggle()
+            }
             KeyCode::Char('g') => self.group = !self.group,
             KeyCode::Char('s') => self.size_filter = self.size_filter.next(),
             KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
@@ -597,7 +599,9 @@ impl App {
     fn handle_confirm_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_deletion(),
-            KeyCode::Char('p') => self.store_action = self.store_action.toggle(),
+            KeyCode::Char('p') if self.store_marked() => {
+                self.store_action = self.store_action.toggle()
+            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = Overlay::None;
             }
@@ -1102,6 +1106,13 @@ impl App {
             );
         }
         self.action = Some(msg);
+    }
+
+    /// Whether any marked row is a pnpm store.
+    fn store_marked(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.ecosystem() == pnpm::STORE_ECOSYSTEM && self.selected.contains(r.path()))
     }
 
     /// Whether any row (sized or not) is a pnpm store.
@@ -1806,11 +1817,12 @@ impl App {
             .rows
             .iter()
             .any(|r| matches!(r, Row::Done(d) if d.mostly_shared() && self.passes(d, now)));
-        if any_shared {
-            hints_view.push_span(Span::styled(
-                "   ⇄ mostly shared — deleting frees little",
-                Style::new().fg(Color::Yellow),
-            ));
+        let shared_legend = Span::styled(
+            "   ⇄ mostly shared — deleting frees little",
+            Style::new().fg(Color::Yellow),
+        );
+        if any_shared && self.action.is_none() {
+            hints_view.push_span(shared_legend.clone());
         }
         let delete_hint = if sel_count > 0 {
             Span::styled("d delete", Style::new().fg(SELECT_FG).bold())
@@ -1826,6 +1838,10 @@ impl App {
             Span::styled("   ? help   q quit", Style::new().fg(Color::DarkGray)),
         ]);
         let mut hints_action = hints_action;
+        // The action message below takes the view-hint line; keep the legend.
+        if any_shared && self.action.is_some() {
+            hints_action.push_span(shared_legend);
+        }
         if self.snapshots {
             hints_action.push_span(Span::styled(
                 "   Time Machine snapshots: space may only free up once they expire",
@@ -2004,18 +2020,6 @@ impl App {
         let dirs = self.selected_dirs();
         let (count, bytes) = self.selected_total();
 
-        // Show a bounded list of paths so a huge selection can't overflow the
-        // screen; the rest is summarised on a trailing line.
-        const MAX_LISTED: usize = 10;
-        let mut lines: Vec<Line> = Vec::new();
-        lines.push(Line::from(Span::styled(
-            format!(
-                "About to remove {count} director{}:",
-                if count == 1 { "y" } else { "ies" }
-            ),
-            Style::new().fg(Color::White).bold(),
-        )));
-        lines.push(Line::raw(""));
         let stores: HashSet<&Path> = self
             .rows
             .iter()
@@ -2024,8 +2028,40 @@ impl App {
                 _ => None,
             })
             .collect();
-        let any_store = dirs.iter().any(|(p, _)| stores.contains(p.as_path()));
-        for (path, size) in dirs.iter().take(MAX_LISTED) {
+        let (store_dirs, other_dirs): (Vec<_>, Vec<_>) =
+            dirs.iter().partition(|(p, _)| stores.contains(p.as_path()));
+        let any_store = !store_dirs.is_empty();
+        let prunes = store_dirs
+            .iter()
+            .filter(|(p, _)| store_action_for(p, self.store_action) == StoreAction::Prune)
+            .count();
+        let removals = count.saturating_sub(prunes);
+        let plural =
+            |n: usize, one: &'static str, many: &'static str| if n == 1 { one } else { many };
+        let heading = match (removals, prunes) {
+            (r, 0) => format!(
+                "About to remove {r} {}:",
+                plural(r, "directory", "directories")
+            ),
+            (0, p) => format!("About to prune {p} {}:", plural(p, "store", "stores")),
+            (r, p) => format!(
+                "About to remove {r} {} and prune {p} {}:",
+                plural(r, "directory", "directories"),
+                plural(p, "store", "stores")
+            ),
+        };
+
+        // Show a bounded list of paths so a huge selection can't overflow the
+        // screen; the rest is summarised on a trailing line. Stores are always
+        // listed, first, since what happens to them depends on the `p` mode.
+        const MAX_LISTED: usize = 10;
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(Span::styled(
+            heading,
+            Style::new().fg(Color::White).bold(),
+        )));
+        lines.push(Line::raw(""));
+        for (path, size) in store_dirs.iter().chain(other_dirs.iter().take(MAX_LISTED)) {
             let mut line = vec![Span::styled(
                 format!("  {:>9}  ", self.fmt_size(*size)),
                 Style::new().fg(Color::Gray),
@@ -2051,9 +2087,9 @@ impl App {
             ));
             lines.push(Line::from(line));
         }
-        if dirs.len() > MAX_LISTED {
+        if other_dirs.len() > MAX_LISTED {
             lines.push(Line::from(Span::styled(
-                format!("  … and {} more", dirs.len() - MAX_LISTED),
+                format!("  … and {} more", other_dirs.len() - MAX_LISTED),
                 Style::new().fg(Color::DarkGray).italic(),
             )));
         }
@@ -2106,7 +2142,14 @@ impl App {
             keys.button(
                 vec![
                     Span::styled("p ", Style::new().fg(Color::Green).bold()),
-                    Span::styled("prune/delete store", Style::new().fg(Color::Gray)),
+                    match self.store_action {
+                        StoreAction::Prune => {
+                            Span::styled("store: prune", Style::new().fg(Color::Gray))
+                        }
+                        StoreAction::Delete => {
+                            Span::styled("store: DELETE", Style::new().fg(Color::Red).bold())
+                        }
+                    },
                 ],
                 ClickAction::ToggleStoreAction,
             );
@@ -2852,6 +2895,95 @@ mod tests {
         assert!(out.contains("prune"), "{out}");
         assert!(out.contains("projects link into it"), "{out}");
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    /// An app with `projects` marked project rows plus a marked store row.
+    fn marked_projects_and_store(projects: usize, store_freeable: u64) -> App {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        for i in 0..projects {
+            let path = PathBuf::from(format!("/tmp/p{i}/node_modules"));
+            app.rows.push(Row::Done(DependencyDir {
+                path: path.clone(),
+                ecosystem: "Node.js",
+                name: "node_modules",
+                kind: DirKind::Dependency,
+                allocated_bytes: 1_000_000,
+                freeable_bytes: 1_000_000,
+                file_count: 1,
+                modified: None,
+            }));
+            app.selected.insert(path);
+        }
+        let store = PathBuf::from("/s/store/v10");
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, store_freeable)));
+        app.selected.insert(store);
+        app
+    }
+
+    #[test]
+    fn confirm_dialog_lists_stores_beyond_the_listed_limit() {
+        let mut app = marked_projects_and_store(12, 1);
+        app.store_action = StoreAction::Delete;
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let out = screen(&mut app, 160, 40);
+        assert!(out.contains("DELETE whole store"), "{out}");
+        assert!(out.contains("… and 2 more"), "{out}");
+    }
+
+    #[test]
+    fn confirm_dialog_counts_prunes_apart_from_removals() {
+        let mut app = marked_projects_and_store(2, 1);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let out = screen(&mut app, 160, 40);
+        assert!(
+            out.contains("About to remove 2 directories and prune 1 store:"),
+            "{out}"
+        );
+        app.store_action = StoreAction::Delete;
+        let out = screen(&mut app, 160, 40);
+        assert!(out.contains("About to remove 3 directories:"), "{out}");
+    }
+
+    #[test]
+    fn confirm_dialog_store_button_shows_the_mode() {
+        let mut app = marked_projects_and_store(1, 1);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(screen(&mut app, 160, 40).contains("p store: prune"));
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(screen(&mut app, 160, 40).contains("p store: DELETE"));
+    }
+
+    #[test]
+    fn store_action_only_toggles_with_a_store_to_act_on() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(app.store_action, StoreAction::Prune);
+
+        // In the dialog only a marked store counts.
+        app.rows.push(Row::Done(store_dir_row(
+            PathBuf::from("/s/store/v10"),
+            500,
+            200,
+        )));
+        app.selected.insert(PathBuf::from("/tmp/node_modules"));
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(app.store_action, StoreAction::Prune);
+    }
+
+    #[test]
+    fn action_message_keeps_the_shared_legend() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("shared", 1000, 10));
+        app.action = Some("Deleted 1 directory".to_string());
+        let out = screen(&mut app, 200, 24);
+        assert!(out.contains("Deleted 1 directory"), "{out}");
+        assert!(out.contains("mostly shared"), "{out}");
     }
 
     #[test]
