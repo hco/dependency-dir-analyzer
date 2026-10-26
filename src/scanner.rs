@@ -77,9 +77,6 @@ where
     }
 }
 
-/// Convert a `SystemTime` to whole seconds since the Unix epoch (may be
-/// negative for pre-1970 timestamps). Returns `None` only if the value is wildly
-/// out of range.
 impl DependencyDir {
     /// The byte count `mode` refers to.
     pub fn bytes(&self, mode: SizeMode) -> u64 {
@@ -96,6 +93,9 @@ impl DependencyDir {
     }
 }
 
+/// Convert a `SystemTime` to whole seconds since the Unix epoch (may be
+/// negative for pre-1970 timestamps). Returns `None` only if the value is wildly
+/// out of range.
 pub fn unix_seconds(t: SystemTime) -> Option<i64> {
     match t.duration_since(SystemTime::UNIX_EPOCH) {
         Ok(d) => i64::try_from(d.as_secs()).ok(),

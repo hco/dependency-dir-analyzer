@@ -2243,7 +2243,6 @@ impl App {
         }
     }
 
-    /// Render a byte count for the size column, honouring the current unit mode.
     /// A row's size in the current mode, flagged with `⇄` when deleting it
     /// would free little because most of it is shared outside.
     fn size_cell(&self, d: &DependencyDir) -> String {
@@ -2255,6 +2254,7 @@ impl App {
         }
     }
 
+    /// Render a byte count for the size column, honouring the current unit mode.
     fn fmt_size(&self, bytes: u64) -> String {
         match self.size_unit {
             SizeUnit::Megabytes => megabytes_size(bytes),
@@ -2290,8 +2290,8 @@ fn view_to_save(
     current
 }
 
-/// Delete (or, for a pnpm store in prune mode, prune) one marked directory,
-/// for the deletion worker.
+/// Delete (or, for a pnpm store that [`store_action_for`] says to prune,
+/// prune) one marked directory, for the deletion worker.
 fn delete_target(dir: DependencyDir, store_action: StoreAction, follow: bool) -> DeleteOutcome {
     if dir.kind == DirKind::PnpmStore {
         if store_action_for(&dir.path, store_action) == StoreAction::Prune {
