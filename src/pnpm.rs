@@ -2,7 +2,7 @@
 //! space they hold shows up as rows of their own.
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
 
 /// Ecosystem label (and row name) for pnpm store rows.
 pub const STORE_ECOSYSTEM: &str = "pnpm store";
@@ -111,10 +111,7 @@ pub fn prune(store: &Path) -> Result<(), String> {
     if !store.is_dir() {
         return Err(format!("store not found; run manually: {manual}"));
     }
-    let output = Command::new(&program)
-        .args(&args)
-        .stdin(Stdio::null())
-        .output()
+    let output = run(&program, &args)
         .map_err(|e| format!("could not start {program}: {e}; run manually: {manual}"))?;
     if output.status.success() {
         return Ok(());
@@ -131,11 +128,7 @@ pub fn prune(store: &Path) -> Result<(), String> {
 
 /// Major version of the pnpm on `PATH`, if there is one.
 fn installed_major() -> Option<u32> {
-    let output = Command::new("pnpm")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let output = run("pnpm", &["--version".to_string()]).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -145,6 +138,30 @@ fn installed_major() -> Option<u32> {
         .next()?
         .parse()
         .ok()
+}
+
+/// Run `program` with `args`, without stdin, and collect its output.
+fn run(program: &str, args: &[String]) -> std::io::Result<Output> {
+    let mut last = None;
+    for name in launch_names(program) {
+        match Command::new(&name).args(args).stdin(Stdio::null()).output() {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => last = Some(e),
+            result => return result,
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::ErrorKind::NotFound.into()))
+}
+
+/// The executable names to try for `program`, in order. On Windows `Command`
+/// only finds `.exe` files on `PATH`, but npx and an npm- or corepack-installed
+/// pnpm are `.cmd` shims. Arguments to those go through `cmd.exe`; Rust
+/// escapes them safely from 1.77.2 on, hence the crate's `rust-version`.
+fn launch_names(program: &str) -> Vec<String> {
+    let mut names = vec![program.to_string()];
+    if cfg!(windows) {
+        names.push(format!("{program}.cmd"));
+    }
+    names
 }
 
 /// A command line to copy into a shell, quoting arguments that need it.
@@ -336,6 +353,15 @@ mod tests {
                 args(&["store", "prune", "--store-dir", "/x/custom"])
             )
         );
+    }
+
+    #[test]
+    fn launch_tries_cmd_shims_on_windows() {
+        // npx is only ever `npx.cmd` on Windows, and so is an npm- or
+        // corepack-installed pnpm; `Command` alone only finds `.exe` files.
+        let names = launch_names("npx");
+        assert_eq!(names[0], "npx");
+        assert_eq!(names.contains(&"npx.cmd".to_string()), cfg!(windows));
     }
 
     #[test]

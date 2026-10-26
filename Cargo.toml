@@ -2,7 +2,7 @@
 name = "dependency-dir-analyzer"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.77.2"
 description = "Scan a directory tree for dependency directories (node_modules, target, .venv, …) and report how much space they use."
 authors = ["Hans-Christian Otto"]
 license = "MIT"
