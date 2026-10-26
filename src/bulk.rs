@@ -132,20 +132,36 @@ fn read_dir(
         // SAFETY: `buf` is `buf_len` initialised bytes, and u8 has no
         // alignment or validity requirements.
         let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf_len) };
-        let mut rest = bytes;
-        for _ in 0..count {
-            let Some(len) = read_u32(rest, 0).map(|len| len as usize) else {
-                return;
-            };
-            // A short or overlong length would loop forever or read past the
-            // buffer; neither should happen, so give up on the directory.
-            if len < offset::COMMON_END || len > rest.len() {
-                return;
-            }
-            entry(dir, &rest[..len], stack, visit);
-            rest = &rest[len..];
+        if !batch(dir, bytes, count as usize, stack, visit) {
+            return;
         }
     }
+}
+
+/// Report the `count` packed entries of `dir` at the start of `bytes`.
+/// Returns `false` if the batch is malformed and the directory should be
+/// given up on.
+fn batch(
+    dir: &Path,
+    bytes: &[u8],
+    count: usize,
+    stack: &mut Vec<PathBuf>,
+    visit: &mut dyn FnMut(Visit<'_>),
+) -> bool {
+    let mut rest = bytes;
+    for _ in 0..count {
+        let Some(len) = read_u32(rest, 0).map(|len| len as usize) else {
+            return false;
+        };
+        // A short or overlong length would loop forever or read past the
+        // buffer; neither should happen, so give up on the directory.
+        if len < offset::COMMON_END || len > rest.len() {
+            return false;
+        }
+        entry(dir, &rest[..len], stack, visit);
+        rest = &rest[len..];
+    }
+    true
 }
 
 /// Report one packed entry of `dir`.
@@ -241,4 +257,234 @@ fn read_u32(bytes: &[u8], at: usize) -> Option<u32> {
 
 fn read_u64(bytes: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_ne_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ALL_COMMON: u32 = COMMON;
+
+    /// The fields of one synthetic `getattrlistbulk` entry.
+    #[derive(Clone)]
+    struct Packed {
+        kind: u32,
+        name: &'static str,
+        returned: (u32, u32, u32),
+        mtime: (i64, u64),
+        dev: i32,
+        ino: u64,
+        nlink: u32,
+        allocated: u64,
+        clone: (u64, u32),
+    }
+
+    fn file(name: &'static str) -> Packed {
+        Packed {
+            kind: VREG,
+            name,
+            returned: (ALL_COMMON, FILE, CLONE),
+            mtime: (1_700_000_000, 5),
+            dev: 0x0100_0010,
+            ino: 42,
+            nlink: 2,
+            allocated: 8192,
+            clone: (7, 3),
+        }
+    }
+
+    fn dir(name: &'static str) -> Packed {
+        Packed {
+            kind: VDIR,
+            returned: (ALL_COMMON, 0, 0),
+            ..file(name)
+        }
+    }
+
+    /// Lay `p` out the way the kernel packs it, name after the fixed part.
+    fn pack(p: &Packed) -> Vec<u8> {
+        let fixed = if p.kind == VREG {
+            offset::FILE_END
+        } else {
+            offset::COMMON_END
+        };
+        let mut e = vec![0u8; fixed];
+        let put = |e: &mut Vec<u8>, at: usize, bytes: &[u8]| {
+            e[at..at + bytes.len()].copy_from_slice(bytes)
+        };
+        put(&mut e, offset::RETURNED_COMMON, &p.returned.0.to_ne_bytes());
+        put(&mut e, offset::RETURNED_FILE, &p.returned.1.to_ne_bytes());
+        put(&mut e, offset::RETURNED_FORK, &p.returned.2.to_ne_bytes());
+        put(
+            &mut e,
+            offset::NAME,
+            &((fixed - offset::NAME) as i32).to_ne_bytes(),
+        );
+        put(
+            &mut e,
+            offset::NAME + 4,
+            &(p.name.len() as u32 + 1).to_ne_bytes(),
+        );
+        put(&mut e, offset::DEV, &p.dev.to_ne_bytes());
+        put(&mut e, offset::OBJTYPE, &p.kind.to_ne_bytes());
+        put(&mut e, offset::MTIME_SEC, &p.mtime.0.to_ne_bytes());
+        put(&mut e, offset::MTIME_NSEC, &p.mtime.1.to_ne_bytes());
+        put(&mut e, offset::INO, &p.ino.to_ne_bytes());
+        if p.kind == VREG {
+            put(&mut e, offset::NLINK, &p.nlink.to_ne_bytes());
+            put(&mut e, offset::ALLOCATED, &p.allocated.to_ne_bytes());
+            put(&mut e, offset::CLONE_ID, &p.clone.0.to_ne_bytes());
+            put(&mut e, offset::CLONE_REFCNT, &p.clone.1.to_ne_bytes());
+        }
+        e.extend_from_slice(p.name.as_bytes());
+        e.push(0);
+        while e.len() % 4 != 0 {
+            e.push(0);
+        }
+        let len = e.len() as u32;
+        put(&mut e, 0, &len.to_ne_bytes());
+        e
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        complete: bool,
+        files: Vec<FileInfo>,
+        modified: Vec<SystemTime>,
+        queued: Vec<PathBuf>,
+    }
+
+    /// Parse `entries` as one batch of `dir`.
+    fn parse(dir: &Path, entries: &[Vec<u8>]) -> Seen {
+        let bytes = entries.concat();
+        let mut seen = Seen::default();
+        let mut files = Vec::new();
+        let mut modified = Vec::new();
+        seen.complete = batch(
+            dir,
+            &bytes,
+            entries.len(),
+            &mut seen.queued,
+            &mut |v| match v {
+                Visit::File(f) => files.push(f),
+                Visit::Modified(m) => modified.push(m),
+                Visit::Unsupported(_) => panic!("a parsed batch is never unsupported"),
+            },
+        );
+        seen.files = files;
+        seen.modified = modified;
+        seen
+    }
+
+    #[test]
+    fn file_entries_are_read_from_their_packed_fields() {
+        let seen = parse(Path::new("/d"), &[pack(&file("a.js"))]);
+        assert_eq!(
+            seen.files,
+            [FileInfo {
+                allocated: 8192,
+                id: Some((0x0100_0010, 42)),
+                nlink: 2,
+                clone: Some(CloneInfo { id: 7, refcnt: 3 }),
+            }]
+        );
+        assert_eq!(
+            seen.modified,
+            [UNIX_EPOCH + Duration::new(1_700_000_000, 5)]
+        );
+        assert!(seen.queued.is_empty());
+    }
+
+    #[test]
+    fn clone_fields_count_only_when_returned() {
+        let mut p = file("a.js");
+        p.returned.2 = libc::ATTR_CMNEXT_CLONEID;
+        assert_eq!(parse(Path::new("/d"), &[pack(&p)]).files[0].clone, None);
+    }
+
+    #[test]
+    fn incomplete_file_entries_fall_back_to_lstat() {
+        let tmp = std::env::temp_dir().join(format!("dda-bulk-{}-lstat", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("real"), vec![1u8; 10_000]).unwrap();
+        let mut p = file("real");
+        p.returned.1 = 0;
+        let seen = parse(&tmp, &[pack(&p)]);
+        let meta = std::fs::symlink_metadata(tmp.join("real")).unwrap();
+        assert_eq!(
+            seen.files,
+            [crate::usage::file_info(&tmp.join("real"), &meta)]
+        );
+        // Gone by the time it is looked at: skipped, like walkdir would.
+        let mut gone = file("gone");
+        gone.returned.1 = 0;
+        assert!(parse(&tmp, &[pack(&gone)]).files.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn directories_are_queued_and_other_types_only_dated() {
+        let mut link = dir("link");
+        link.kind = 5; // VLNK
+        let seen = parse(Path::new("/d"), &[pack(&dir("sub")), pack(&link)]);
+        assert_eq!(seen.queued, [PathBuf::from("/d/sub")]);
+        assert!(seen.files.is_empty());
+        assert_eq!(seen.modified.len(), 2);
+    }
+
+    #[test]
+    fn names_pointing_outside_the_entry_are_ignored() {
+        let mut e = pack(&dir("sub"));
+        e[offset::NAME..offset::NAME + 4].copy_from_slice(&1000i32.to_ne_bytes());
+        assert!(parse(Path::new("/d"), &[e.clone()]).queued.is_empty());
+        e[offset::NAME..offset::NAME + 4].copy_from_slice(&(-8i32).to_ne_bytes());
+        assert!(parse(Path::new("/d"), &[e]).queued.is_empty());
+    }
+
+    #[test]
+    fn entries_without_name_or_type_are_skipped() {
+        let mut p = dir("sub");
+        p.returned.0 = ALL_COMMON & !libc::ATTR_CMN_OBJTYPE;
+        let seen = parse(Path::new("/d"), &[pack(&p)]);
+        assert!(seen.queued.is_empty());
+        assert!(seen.modified.is_empty());
+    }
+
+    #[test]
+    fn modification_times_before_the_epoch_are_kept() {
+        let mut p = file("old");
+        p.mtime = (-10, 500);
+        assert_eq!(
+            parse(Path::new("/d"), &[pack(&p)]).modified,
+            [UNIX_EPOCH - Duration::from_secs(10) + Duration::from_nanos(500)]
+        );
+    }
+
+    #[test]
+    fn malformed_lengths_end_the_batch() {
+        let good = pack(&file("a"));
+        // A zero length would never advance; an overlong one reads past the
+        // buffer. Both stop the batch after what was parsed before them.
+        let mut zero = pack(&file("b"));
+        zero[0..4].copy_from_slice(&0u32.to_ne_bytes());
+        let mut long = pack(&file("c"));
+        long[0..4].copy_from_slice(&10_000u32.to_ne_bytes());
+        for bad in [zero, long] {
+            let seen = parse(Path::new("/d"), &[good.clone(), bad, good.clone()]);
+            assert_eq!(seen.files.len(), 1);
+            assert!(!seen.complete);
+        }
+        assert!(parse(Path::new("/d"), &[good.clone(), good]).complete);
+    }
+
+    #[test]
+    fn file_entries_too_short_for_file_fields_fall_back() {
+        // Packed like a directory, so the file fields would be the name.
+        let mut e = pack(&dir("missing"));
+        e[offset::OBJTYPE..offset::OBJTYPE + 4].copy_from_slice(&VREG.to_ne_bytes());
+        e[offset::RETURNED_FILE..offset::RETURNED_FILE + 4].copy_from_slice(&FILE.to_ne_bytes());
+        assert!(e.len() < offset::FILE_END);
+        assert!(parse(Path::new("/nonexistent"), &[e]).files.is_empty());
+    }
 }
