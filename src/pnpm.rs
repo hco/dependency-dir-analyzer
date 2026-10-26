@@ -222,7 +222,7 @@ fn parse_major(version: &str) -> Option<u32> {
 fn run(program: &str, args: &[String]) -> std::io::Result<Output> {
     let mut last = None;
     for name in launch_names(program) {
-        match Command::new(&name).args(args).stdin(Stdio::null()).output() {
+        match command(&name).args(args).output() {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => last = Some(e),
             result => return result,
         }
@@ -234,6 +234,30 @@ fn run(program: &str, args: &[String]) -> std::io::Result<Output> {
 /// only finds `.exe` files on `PATH`, but npx and an npm- or corepack-installed
 /// pnpm are `.cmd` shims. Arguments to those go through `cmd.exe`; Rust
 /// escapes them safely from 1.77.2 on, hence the crate's `rust-version`.
+/// A command for `program` that starts in [`launch_dir`] with no stdin.
+fn command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.current_dir(launch_dir()).stdin(Stdio::null());
+    cmd
+}
+
+/// Where pnpm and npx run. Not the directory dda was started in: there a
+/// project's `node_modules/.bin/pnpm`, `.npmrc` or `.pnpmfile.cjs` could
+/// stand in for the real pnpm or change what it does.
+fn launch_dir() -> PathBuf {
+    launch_dir_with(|name| std::env::var_os(name))
+}
+
+/// The user's home directory, or the filesystem root without one.
+fn launch_dir_with(var: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    let home = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    var(home)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from(std::path::MAIN_SEPARATOR_STR))
+}
+
 fn launch_names(program: &str) -> Vec<String> {
     let mut names = vec![program.to_string()];
     if cfg!(windows) {
@@ -633,5 +657,28 @@ mod tests {
         std::fs::write(tmp.join(".modules.yaml"), yaml).unwrap();
         assert_eq!(store_dir_for(&tmp), Some(store));
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn launch_dir_is_the_home_directory() {
+        let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        let home = std::env::temp_dir();
+        let with_home = |name: &str| (name == home_var).then(|| home.clone().into_os_string());
+        assert_eq!(launch_dir_with(with_home), home);
+    }
+
+    #[test]
+    fn launch_dir_falls_back_to_the_root() {
+        let root = PathBuf::from(std::path::MAIN_SEPARATOR_STR);
+        assert_eq!(launch_dir_with(|_| None), root);
+        assert_eq!(launch_dir_with(|_| Some(OsString::new())), root);
+        let missing = |_: &str| Some(OsString::from("/definitely/not/a/home"));
+        assert_eq!(launch_dir_with(missing), root);
+    }
+
+    #[test]
+    fn commands_do_not_run_in_the_current_directory() {
+        let cmd = command("pnpm");
+        assert_eq!(cmd.get_current_dir(), Some(launch_dir().as_path()));
     }
 }
