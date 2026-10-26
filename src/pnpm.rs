@@ -266,21 +266,52 @@ fn launch_names(program: &str) -> Vec<String> {
     names
 }
 
-/// A command line to copy into a POSIX shell, quoting arguments that need it.
+/// A command line to copy into the platform's shell, quoting arguments that
+/// need it.
 fn shell_line(program: &str, args: &[String]) -> String {
+    if cfg!(windows) {
+        windows_line(program, args)
+    } else {
+        posix_line(program, args)
+    }
+}
+
+/// `program args…` for a POSIX shell.
+fn posix_line(program: &str, args: &[String]) -> String {
+    // Quote everything but plainly safe words, so no glob, separator,
+    // expansion or empty argument can change what the line does.
+    quoted_line(program, args, "@%+=:,./_-", |arg| {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    })
+}
+
+/// `program args…` for cmd.exe or PowerShell: both read "…" as one word,
+/// and `""` inside it as a quote. cmd also splits words at `,`, `;` and `=`.
+fn windows_line(program: &str, args: &[String]) -> String {
+    quoted_line(program, args, "@+:./_-\\", |arg| {
+        format!("\"{}\"", arg.replace('"', "\"\""))
+    })
+}
+
+/// `program` followed by `args`, each quoted with `quote` unless it is
+/// non-empty and made of ASCII letters, digits and `safe` only.
+fn quoted_line(
+    program: &str,
+    args: &[String],
+    safe: &str,
+    quote: impl Fn(&str) -> String,
+) -> String {
     let mut line = program.to_string();
     for arg in args {
         line.push(' ');
-        // Quote everything but plainly safe words, so no glob, separator,
-        // expansion or empty argument can change what the line does.
-        let safe = !arg.is_empty()
+        let plain = !arg.is_empty()
             && arg
                 .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c));
-        if safe {
+                .all(|c| c.is_ascii_alphanumeric() || safe.contains(c));
+        if plain {
             line.push_str(arg);
         } else {
-            line.push_str(&format!("'{}'", arg.replace('\'', r"'\''")));
+            line.push_str(&quote(arg));
         }
     }
     line
@@ -516,7 +547,7 @@ mod tests {
 
     #[test]
     fn shell_line_quotes_anything_a_shell_would_interpret() {
-        let line = shell_line(
+        let line = posix_line(
             "pnpm",
             &args(&[
                 "store",
@@ -536,6 +567,43 @@ mod tests {
             line,
             r"pnpm store --store-dir '/a b/it'\''s' '$HOME' '*' 'x;y' 'a&b' '~' '' 'C:\Users' pnpm@10"
         );
+    }
+
+    #[test]
+    fn windows_lines_use_double_quotes() {
+        // cmd.exe and PowerShell both take "…"; single quotes are no quoting
+        // to cmd, and it splits words at `,`, `;` and `=` too.
+        let line = windows_line(
+            "pnpm.cmd",
+            &args(&[
+                "store",
+                "--store-dir",
+                r"C:\Users\Jo Doe\AppData\Local\pnpm\store\v10",
+                r"C:\plain\v10",
+                "a,b",
+                "x=y",
+                "x;y",
+                "a&b",
+                "say \"hi\"",
+                "",
+                "pnpm@10",
+            ]),
+        );
+        assert_eq!(
+            line,
+            r#"pnpm.cmd store --store-dir "C:\Users\Jo Doe\AppData\Local\pnpm\store\v10" C:\plain\v10 "a,b" "x=y" "x;y" "a&b" "say ""hi""" "" pnpm@10"#
+        );
+    }
+
+    #[test]
+    fn shell_line_quotes_for_the_platform_shell() {
+        let args = args(&["--store-dir", "/a b"]);
+        let expected = if cfg!(windows) {
+            windows_line("pnpm", &args)
+        } else {
+            posix_line("pnpm", &args)
+        };
+        assert_eq!(shell_line("pnpm", &args), expected);
     }
 
     #[test]
