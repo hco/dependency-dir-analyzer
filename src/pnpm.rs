@@ -237,18 +237,21 @@ fn launch_names(program: &str) -> Vec<String> {
     names
 }
 
-/// A command line to copy into a shell, quoting arguments that need it.
+/// A command line to copy into a POSIX shell, quoting arguments that need it.
 fn shell_line(program: &str, args: &[String]) -> String {
     let mut line = program.to_string();
     for arg in args {
         line.push(' ');
-        if arg
-            .chars()
-            .any(|c| c.is_whitespace() || "'\"$`\\".contains(c))
-        {
-            line.push_str(&format!("'{}'", arg.replace('\'', r"'\''")));
-        } else {
+        // Quote everything but plainly safe words, so no glob, separator,
+        // expansion or empty argument can change what the line does.
+        let safe = !arg.is_empty()
+            && arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "@%+=:,./_-".contains(c));
+        if safe {
             line.push_str(arg);
+        } else {
+            line.push_str(&format!("'{}'", arg.replace('\'', r"'\''")));
         }
     }
     line
@@ -467,6 +470,30 @@ mod tests {
         let names = launch_names("npx");
         assert_eq!(names[0], "npx");
         assert_eq!(names.contains(&"npx.cmd".to_string()), cfg!(windows));
+    }
+
+    #[test]
+    fn shell_line_quotes_anything_a_shell_would_interpret() {
+        let line = shell_line(
+            "pnpm",
+            &args(&[
+                "store",
+                "--store-dir",
+                "/a b/it's",
+                "$HOME",
+                "*",
+                "x;y",
+                "a&b",
+                "~",
+                "",
+                "C:\\Users",
+                "pnpm@10",
+            ]),
+        );
+        assert_eq!(
+            line,
+            r"pnpm store --store-dir '/a b/it'\''s' '$HOME' '*' 'x;y' 'a&b' '~' '' 'C:\Users' pnpm@10"
+        );
     }
 
     #[test]
