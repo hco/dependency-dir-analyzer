@@ -114,7 +114,7 @@ it overrides the remembered choice for that run.
 | `A`                  | Mark / unmark all visible directories       |
 | `c`                  | Clear the selection                         |
 | `d` / `Del`          | Delete marked directories (asks to confirm) |
-| `p`                  | pnpm stores: prune (default) ↔ delete whole |
+| `p`                  | pnpm stores: prune (default) ↔ delete whole (not pnpm 11) |
 | `?`                  | Toggle the keyboard-shortcuts help          |
 | `q` / `Esc`          | Quit                                        |
 

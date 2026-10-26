@@ -1880,7 +1880,7 @@ impl App {
             help_line("S", "cycle sort (size · modified · name · files)"),
             help_line("f", "toggle size shown (freeable · on disk)"),
             help_line("u", "toggle size units (MB · auto)"),
-            help_line("p", "pnpm stores: prune (default) or delete whole"),
+            help_line("p", "pnpm stores: prune (default) or delete (not pnpm 11)"),
             help_line("i", "cycle ecosystem icons (emoji · nerd · off)"),
             help_line("g", "toggle grouping by ecosystem"),
             help_line("Enter / Space", "fold/unfold selected group"),
