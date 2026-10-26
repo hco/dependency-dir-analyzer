@@ -2032,7 +2032,11 @@ impl App {
             )];
             // Say what happens to a store before its (possibly cut off) path.
             if stores.contains(path.as_path()) {
-                line.push(match self.store_action {
+                line.push(match store_action_for(path, self.store_action) {
+                    StoreAction::Prune if self.store_action == StoreAction::Delete => Span::styled(
+                        "prune (projects link into it) ",
+                        Style::new().fg(Color::Green).bold(),
+                    ),
                     StoreAction::Prune => {
                         Span::styled("prune ", Style::new().fg(Color::Green).bold())
                     }
@@ -2226,7 +2230,7 @@ impl App {
 /// for the deletion worker.
 fn delete_target(dir: DependencyDir, store_action: StoreAction, follow: bool) -> DeleteOutcome {
     if dir.kind == DirKind::PnpmStore {
-        if store_action == StoreAction::Prune {
+        if store_action_for(&dir.path, store_action) == StoreAction::Prune {
             return prune_store(dir, follow);
         }
         // Re-checked right before removing: store paths come from files in
@@ -2249,6 +2253,18 @@ fn delete_target(dir: DependencyDir, store_action: StoreAction, follow: bool) ->
             verb: "delete",
             error: e.to_string(),
         },
+    }
+}
+
+/// What actually happens to `store` when `chosen` is the store action: a
+/// store whose `links/` projects' `node_modules` point into (pnpm 11) is only
+/// ever pruned, since removing it would break every one of those projects
+/// until its next `pnpm install`.
+fn store_action_for(store: &Path, chosen: StoreAction) -> StoreAction {
+    if pnpm::projects_link_into(store) {
+        StoreAction::Prune
+    } else {
+        chosen
     }
 }
 
@@ -2789,6 +2805,53 @@ mod tests {
         app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
         assert!(matches!(app.overlay, Overlay::ConfirmDelete));
         assert!(screen(&mut app, 140, 30).contains("DELETE whole store"));
+    }
+
+    /// A pnpm 11 style store: projects' `node_modules` symlink into `links/`.
+    fn linked_store(tag: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!("dda-store-{tag}-{}", std::process::id()));
+        let store = tmp.join("v11");
+        std::fs::create_dir_all(store.join("files")).unwrap();
+        std::fs::create_dir_all(store.join("links")).unwrap();
+        std::fs::write(store.join("index.db"), b"").unwrap();
+        store
+    }
+
+    #[test]
+    fn stores_projects_link_into_are_only_ever_pruned() {
+        let store = linked_store("linked-action");
+        assert_eq!(
+            store_action_for(&store, StoreAction::Delete),
+            StoreAction::Prune
+        );
+        assert_eq!(
+            store_action_for(&store, StoreAction::Prune),
+            StoreAction::Prune
+        );
+        std::fs::remove_dir_all(store.join("links")).unwrap();
+        assert_eq!(
+            store_action_for(&store, StoreAction::Delete),
+            StoreAction::Delete
+        );
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    #[test]
+    fn confirm_dialog_never_offers_deleting_a_linked_store() {
+        let store = linked_store("linked-dialog");
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.store_action = StoreAction::Delete;
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, 200)));
+        app.selected.insert(store.clone());
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+
+        let out = screen(&mut app, 160, 30);
+        assert!(!out.contains("DELETE whole store"), "{out}");
+        assert!(out.contains("prune"), "{out}");
+        assert!(out.contains("projects link into it"), "{out}");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 
     #[test]

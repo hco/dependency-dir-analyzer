@@ -32,7 +32,7 @@ brew install hco/tap/dda
   size any time. See [How sizes are measured](#how-sizes-are-measured).
 - **pnpm stores** — the stores your projects install from are listed too, and
   deleting one prunes it (`pnpm store prune`) unless you ask for the whole
-  store to go.
+  store to go (never for a pnpm 11 store, which projects link into).
 - **Size _and_ last-modified time** — stale directories (good cleanup
   candidates) are colour-coded by age, so you can tell a six-month-old
   `node_modules` from one you built this morning.
@@ -130,9 +130,13 @@ packages no project references anymore are removed, so nothing has to be
 downloaded again. Marked projects are deleted first, so the prune also drops
 what only they were using. Press `p` (or click the `store:` chip) to delete the
 whole store instead; the confirmation dialog names the action per store, and
-the choice is remembered. dda runs the installed `pnpm` when it reads that
-store's layout (`v10` → pnpm 10, `v3` → pnpm 7–9) and `npx pnpm@<major>`
-otherwise. If that fails, the footer shows the command to run yourself.
+the choice is remembered. Every project that used a deleted store installs
+its packages again on its next `pnpm install`. A store with a `links/`
+directory (pnpm 11) is only ever pruned: projects' `node_modules` are
+symlinks into it, so deleting it would break them until they reinstall. dda
+runs the installed `pnpm` when it reads that store's layout (`v10` → pnpm 10,
+`v3` → pnpm 7–9) and `npx pnpm@<major>` otherwise; layouts no pnpm writes
+are not pruned. If that fails, the footer shows the command to run yourself.
 
 ### Mouse
 
@@ -214,7 +218,8 @@ not freeable, even though deleting both would free them.
 ### pnpm stores
 
 pnpm keeps one store of packages per machine and clones or hardlinks them into
-every project's `node_modules`. dda reads each `node_modules/.modules.yaml` to
+every project's `node_modules` (pnpm 11 symlinks them from the store's
+`links/` instead). dda reads each `node_modules/.modules.yaml` to
 find the stores in use and lists each one once (including pnpm's default
 location, unless `--no-pnpm-default-store` or the `pnpm_default_store`
 setting turns that off). A store's freeable size is roughly what

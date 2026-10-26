@@ -301,6 +301,8 @@ pub enum StoreAction {
     #[default]
     Prune,
     /// Remove the whole store; every project re-downloads on next install.
+    /// Never applied to a store projects link into (pnpm 11's `links/`),
+    /// which is pruned instead.
     Delete,
 }
 

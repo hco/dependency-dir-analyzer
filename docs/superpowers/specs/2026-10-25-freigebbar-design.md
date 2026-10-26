@@ -141,9 +141,12 @@ Ersetzt die bisherige logische Summe. Damit gilt immer freigebbar ≤ Größe.
   - **prune** (Default): dda führt `pnpm store prune` für diesen Store aus;
     nur ungenutzte Pakete verschwinden.
   - **komplett löschen**: der ganze Store-Ordner wird gelöscht wie jede andere
-    Zeile. Unbedenklich für bestehende Projekte (Clones/Hardlinks sind
-    eigenständige Dateien), kostet aber Re-Downloads bei der nächsten
-    Installation. Da der Ordner als Ganzes weggeht, bleibt nichts
+    Zeile. Unbedenklich für Projekte, deren Pakete Clones/Hardlinks sind
+    (eigenständige Dateien), kostet aber Re-Downloads bei der nächsten
+    Installation. Nachtrag: Seit pnpm 11 liegen die Pakete unter
+    `<store>/v11/links/` und die `node_modules` der Projekte sind Symlinks
+    dorthin; Löschen würde sie bis zum nächsten `pnpm install` kaputt machen.
+    Stores mit `links/` werden deshalb immer nur geprunt. Da der Ordner als Ganzes weggeht, bleibt nichts
     Inkonsistentes zurück (kein Konflikt mit dem Anti-Ziel).
 
   Danach wird die Store-Zeile neu gemessen (bzw. verschwindet).

@@ -184,6 +184,12 @@ fn shell_line(program: &str, args: &[String]) -> String {
     line
 }
 
+/// Whether projects' `node_modules` symlink into `store`: pnpm 11 keeps
+/// packages under the store's `links/` and only links them into each project.
+pub fn projects_link_into(store: &Path) -> bool {
+    store.join("links").is_dir()
+}
+
 /// Whether `store` is laid out like a pnpm store: a `v<N>` directory holding
 /// `files/` plus either pnpm 10+'s index or project registry, or (pnpm 7-9's
 /// `v3`) two-hex-digit content buckets under `files/`. Paths come from
