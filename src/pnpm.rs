@@ -1,6 +1,7 @@
 //! pnpm's content-addressable store: finding the stores projects use, so the
 //! space they hold shows up as rows of their own.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -112,10 +113,14 @@ pub fn store_dir_for(node_modules: &Path) -> Option<PathBuf> {
 /// The versioned stores (`v3`, `v10`, …) under pnpm's default store location
 /// for this platform, whether or not any project in the scan uses them.
 pub fn default_store_dirs() -> Vec<PathBuf> {
-    let Some(base) = default_store_root() else {
-        return Vec::new();
-    };
-    let Ok(entries) = std::fs::read_dir(&base) else {
+    default_store_root_with(|name| std::env::var_os(name))
+        .map(|root| version_dirs(&root))
+        .unwrap_or_default()
+}
+
+/// The `v<N>` directories directly inside `base`, sorted.
+fn version_dirs(base: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(base) else {
         return Vec::new();
     };
     let mut dirs: Vec<PathBuf> = entries
@@ -205,12 +210,12 @@ fn installed_major() -> Option<u32> {
     if !output.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .split('.')
-        .next()?
-        .parse()
-        .ok()
+    parse_major(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The major version in `pnpm --version` output such as `10.4.1`.
+fn parse_major(version: &str) -> Option<u32> {
+    version.trim().split('.').next()?.parse().ok()
 }
 
 /// Run `program` with `args`, without stdin, and collect its output.
@@ -303,29 +308,33 @@ fn is_version_dir(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// pnpm's default store location on this platform, reading environment
+/// variables through `var`.
 #[cfg(target_os = "macos")]
-fn default_store_root() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join("Library/pnpm/store"))
+fn default_store_root_with(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(PathBuf::from(var("HOME")?).join("Library/pnpm/store"))
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
-fn default_store_root() -> Option<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
+fn default_store_root_with(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let data = var("XDG_DATA_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
+        .or_else(|| var("HOME").map(|h| PathBuf::from(h).join(".local/share")))?;
     Some(data.join("pnpm/store"))
 }
 
 #[cfg(windows)]
-fn default_store_root() -> Option<PathBuf> {
-    let local = std::env::var_os("LOCALAPPDATA")?;
-    Some(PathBuf::from(local).join("pnpm").join("store"))
+fn default_store_root_with(var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    Some(
+        PathBuf::from(var("LOCALAPPDATA")?)
+            .join("pnpm")
+            .join("store"),
+    )
 }
 
 #[cfg(not(any(unix, windows)))]
-fn default_store_root() -> Option<PathBuf> {
+fn default_store_root_with(_var: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     None
 }
 
@@ -494,6 +503,76 @@ mod tests {
             line,
             r"pnpm store --store-dir '/a b/it'\''s' '$HOME' '*' 'x;y' 'a&b' '~' '' 'C:\Users' pnpm@10"
         );
+    }
+
+    #[test]
+    fn pnpm_version_output_gives_the_major() {
+        assert_eq!(parse_major("10.4.1\n"), Some(10));
+        assert_eq!(parse_major("11.0.0-rc.1"), Some(11));
+        assert_eq!(parse_major("  9\n"), Some(9));
+        assert_eq!(parse_major(""), None);
+        assert_eq!(parse_major("pnpm: command not found"), None);
+    }
+
+    #[test]
+    fn only_version_dirs_count_as_default_stores() {
+        let tmp = std::env::temp_dir().join(format!("dda-pnpm-{}-defaults", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        for dir in ["v3", "v10", "tmp", "v10-old"] {
+            std::fs::create_dir_all(tmp.join(dir)).unwrap();
+        }
+        std::fs::write(tmp.join("v11"), b"not a dir").unwrap();
+        assert_eq!(version_dirs(&tmp), vec![tmp.join("v10"), tmp.join("v3")]);
+        assert!(version_dirs(&tmp.join("missing")).is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// An environment lookup over fixed variables.
+    fn env(vars: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<OsString> {
+        let vars = vars.to_vec();
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| OsString::from(v))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_store_root_is_under_library() {
+        assert_eq!(
+            default_store_root_with(env(&[("HOME", "/Users/me")])),
+            Some(PathBuf::from("/Users/me/Library/pnpm/store"))
+        );
+        assert_eq!(default_store_root_with(env(&[])), None);
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn default_store_root_follows_xdg_data_home() {
+        let home = ("HOME", "/home/me");
+        assert_eq!(
+            default_store_root_with(env(&[home, ("XDG_DATA_HOME", "/data")])),
+            Some(PathBuf::from("/data/pnpm/store"))
+        );
+        // Empty or unset falls back to the XDG default under HOME.
+        for vars in [vec![home, ("XDG_DATA_HOME", "")], vec![home]] {
+            assert_eq!(
+                default_store_root_with(env(&vars)),
+                Some(PathBuf::from("/home/me/.local/share/pnpm/store"))
+            );
+        }
+        assert_eq!(default_store_root_with(env(&[])), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn default_store_root_is_under_local_app_data() {
+        assert_eq!(
+            default_store_root_with(env(&[("LOCALAPPDATA", r"C:\Users\me\AppData\Local")])),
+            Some(PathBuf::from(r"C:\Users\me\AppData\Local\pnpm\store"))
+        );
+        assert_eq!(default_store_root_with(env(&[])), None);
     }
 
     #[test]
