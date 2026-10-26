@@ -2888,7 +2888,7 @@ mod tests {
     fn linked_store(tag: &str) -> PathBuf {
         let tmp = std::env::temp_dir().join(format!("dda-store-{tag}-{}", std::process::id()));
         let store = tmp.join("v11");
-        std::fs::create_dir_all(store.join("files")).unwrap();
+        std::fs::create_dir_all(store.join("files").join("00")).unwrap();
         std::fs::create_dir_all(store.join("links")).unwrap();
         std::fs::write(store.join("index.db"), b"").unwrap();
         store
@@ -3148,7 +3148,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         let store = tmp.join("real").join("v10");
         std::fs::create_dir_all(store.join("files").join("00")).unwrap();
-        std::fs::create_dir_all(store.join("index")).unwrap();
+        std::fs::create_dir_all(store.join("index").join("00")).unwrap();
         let link = tmp.join("link");
         std::os::unix::fs::symlink(&store, &link).unwrap();
 
@@ -3172,7 +3172,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("dda-store-del-{}", std::process::id()));
         let store = tmp.join("v10");
         std::fs::create_dir_all(store.join("files").join("00")).unwrap();
-        std::fs::create_dir_all(store.join("index")).unwrap();
+        std::fs::create_dir_all(store.join("index").join("00")).unwrap();
         std::fs::write(store.join("files").join("00").join("blob"), b"x").unwrap();
 
         let mut app = App::new(tmp.clone(), 0, 0, ViewState::default());

@@ -735,7 +735,7 @@ mod tests {
     /// A minimal pnpm 10+ store: content under `files/<hex>/`, plus `index`.
     fn make_store(store: &Path) {
         fs::create_dir_all(store.join("files").join("00")).unwrap();
-        fs::create_dir_all(store.join("index")).unwrap();
+        fs::create_dir_all(store.join("index").join("00")).unwrap();
         fs::write(store.join("files").join("00").join("blob"), vec![7u8; 4096]).unwrap();
     }
 
@@ -829,6 +829,42 @@ mod tests {
             assert!(
                 results.iter().all(|d| d.kind == DirKind::Dependency),
                 "{results:?}"
+            );
+        }
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn api_routes_named_like_a_store_are_scanned_as_source() {
+        // `app/api/v1/{files,projects}` and friends are routes, not stores:
+        // no store row, neither from the walk nor from `.modules.yaml`, and
+        // their insides are still scanned.
+        let tmp = fresh_dir("store-routes");
+        let api = tmp.join("web").join("app").join("api");
+        for (route, dirs) in [
+            ("v1", ["files/[id]", "projects/[id]"]),
+            ("v3", ["files/[id]", "links/[slug]"]),
+            ("v10", ["files/00", "index/[id]"]),
+        ] {
+            for dir in dirs {
+                fs::create_dir_all(api.join(route).join(dir)).unwrap();
+            }
+            fs::write(api.join(route).join("files").join("route.ts"), b"x").unwrap();
+            fs::create_dir_all(api.join(route).join("files").join("node_modules")).unwrap();
+        }
+        pnpm_project(&tmp, "proj", &api.join("v10"));
+
+        let results = scan(&tmp, &ScanOptions::default());
+        assert!(
+            results.iter().all(|d| d.kind == DirKind::Dependency),
+            "{results:?}"
+        );
+        for route in ["v1", "v3", "v10"] {
+            let nested = api.join(route).join("files").join("node_modules");
+            assert!(
+                results.iter().any(|d| d.path == nested),
+                "{route}: {results:?}"
             );
         }
 

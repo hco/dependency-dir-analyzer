@@ -292,38 +292,47 @@ pub fn projects_link_into(store: &Path) -> bool {
     store.join("links").is_dir()
 }
 
-/// Whether `store` is laid out like a pnpm store: a `v<N>` directory holding
-/// `files/` plus either pnpm 10+'s index or project registry, or (pnpm 7-9's
-/// `v3`) two-hex-digit content buckets under `files/`. Paths come from
-/// `.modules.yaml` files in the scanned tree, so anything else (a broken or
-/// hostile `storeDir: /`) must never become a deletable row.
+/// Whether `store` is laid out like a pnpm store: a layout pnpm writes (`v3`
+/// or `v10`+) whose `files/` holds two-hex-digit content buckets, plus for
+/// `v10`+ an `index.db` or an `index/` of buckets. The walk tests every
+/// directory and `.modules.yaml` files name any path, so source folders such
+/// as `app/api/v1/files` or a hostile `storeDir: /` must never become a
+/// deletable row.
 pub fn looks_like_store(store: &Path) -> bool {
-    let named_like_store = store
-        .file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(is_version_dir);
-    let files = store.join("files");
-    if !named_like_store || !files.is_dir() {
-        return false;
-    }
-    ["index", "index.db", "projects", "links"]
-        .iter()
-        .any(|marker| store.join(marker).exists())
-        || has_hex_bucket(&files)
-}
-
-/// Whether `files` holds a content bucket such as `0a/`.
-fn has_hex_bucket(files: &Path) -> bool {
-    let Ok(entries) = std::fs::read_dir(files) else {
+    let Some(major) = store_major(store) else {
         return false;
     };
-    entries.filter_map(|e| e.ok()).any(|e| {
-        let name = e.file_name();
+    holds_only_buckets(&store.join("files"))
+        && (major < 10
+            || store.join("index.db").is_file()
+            || holds_only_buckets(&store.join("index")))
+}
+
+/// Whether `dir` has two-hex-digit bucket directories and no others. Loose
+/// and hidden files are fine: pnpm leaves temp files in `files/`.
+fn holds_only_buckets(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    let mut buckets = 0;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let name = entry.file_name();
         let name = name.to_string_lossy();
-        name.len() == 2
-            && name.bytes().all(|b| b.is_ascii_hexdigit())
-            && e.file_type().is_ok_and(|t| t.is_dir())
-    })
+        if name.starts_with('.') {
+            continue;
+        }
+        if name.len() != 2 || !name.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        buckets += 1;
+    }
+    buckets > 0
 }
 
 /// Whether `name` looks like a store layout version directory (`v10`).
@@ -613,11 +622,18 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("dda-pnpm-{}-layout", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let mk = |p: &str| std::fs::create_dir_all(tmp.join(p)).unwrap();
-        // pnpm 10/11: `files/` next to an index or project registry.
-        mk("v10/files");
-        mk("v10/index");
-        mk("v11/files");
-        std::fs::write(tmp.join("v11/index.db"), b"").unwrap();
+        let touch = |p: &str| std::fs::write(tmp.join(p), b"").unwrap();
+        // pnpm 10: hex buckets under both `files/` and `index/`.
+        mk("v10/files/00");
+        mk("v10/files/ff");
+        mk("v10/index/0a");
+        mk("v10/projects");
+        // pnpm 11: `index.db`; stray files and hidden entries in `files/`.
+        mk("v11/files/3c");
+        touch("v11/files/stream942634");
+        touch("v11/files/.DS_Store");
+        touch("v11/index.db");
+        mk("v11/links");
         // pnpm 7-9 (`v3`): only `files/`, with two-hex-digit buckets.
         mk("v3/files/0a");
         mk("v3/tmp");
@@ -625,7 +641,7 @@ mod tests {
         mk("v2/files/photos");
         mk("v12");
         mk("other/files/00");
-        mk("other/index");
+        mk("other/index/00");
         assert!(looks_like_store(&tmp.join("v10")));
         assert!(looks_like_store(&tmp.join("v11")));
         assert!(looks_like_store(&tmp.join("v3")));
@@ -633,6 +649,41 @@ mod tests {
         assert!(!looks_like_store(&tmp.join("v12")));
         assert!(!looks_like_store(&tmp.join("other")));
         assert!(!looks_like_store(&tmp));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn source_folders_laid_out_like_a_store_are_not_stores() {
+        // API routes such as `app/api/v1/files` share names with a store.
+        let tmp = std::env::temp_dir().join(format!("dda-pnpm-{}-lookalike", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let mk = |p: &str| std::fs::create_dir_all(tmp.join(p)).unwrap();
+        let touch = |p: &str| std::fs::write(tmp.join(p), b"").unwrap();
+        // A version pnpm never wrote, even with hex buckets.
+        mk("v1/files/00");
+        mk("v1/projects");
+        mk("v4/files/00");
+        touch("v4/index.db");
+        // `v3` whose `files/` holds source, not buckets.
+        mk("v3/files/[id]");
+        touch("v3/files/route.ts");
+        mk("v3/links");
+        // A bucket next to another directory.
+        mk("v3b/v3/files/00");
+        mk("v3b/v3/files/docs");
+        // `v10` with buckets in `files/` but none in `index/`, or no index.
+        mk("v10/files/00");
+        mk("v10/index/[id]");
+        touch("v10/index/route.ts");
+        mk("v11/files/ab");
+        mk("v11/projects");
+        mk("v11/links");
+        // Empty `files/` and `index/`.
+        mk("v12/files");
+        mk("v12/index");
+        for dir in ["v1", "v4", "v3", "v3b/v3", "v10", "v11", "v12"] {
+            assert!(!looks_like_store(&tmp.join(dir)), "{dir}");
+        }
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
