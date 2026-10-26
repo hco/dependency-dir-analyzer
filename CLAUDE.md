@@ -49,6 +49,7 @@ src/
   cli.rs        # clap argument definitions, `completions` subcommand, `parse_size`
   scanner.rs    # filesystem walk, patterns, parallel sizing, batch + streaming APIs
   usage.rs      # per-file allocated bytes + hardlink/APFS-clone identity; freeable accounting
+  bulk.rs       # macOS-only fast tree walk via getattrlistbulk (sizes, links, clone ids per directory)
   pnpm.rs       # pnpm store discovery (.modules.yaml, default location) and `pnpm store prune`
   report.rs     # Report struct + table/JSON/CSV rendering, size & age formatting
   tui.rs        # interactive live-updating ratatui UI (consumes the streaming scan)
@@ -81,7 +82,9 @@ mise.toml       # toolchain + tasks
   hardlinks once, like `du`) and `freeable_bytes` (what deleting it frees: a
   hardlink or APFS clone counts only if every link/clone lies inside the row).
   `SizeMode` picks which one the UI shows; deletion figures are always freeable.
-  Clone ids and refcounts come from `getattrlist` on macOS only.
+  Clone ids and refcounts exist on macOS only: `bulk.rs` reads them (with
+  sizes and link counts) per directory via `getattrlistbulk`; per-file
+  `getattrlist` remains for `--follow-symlinks` and unsupported volumes.
 - `node_modules/.modules.yaml` names the pnpm store a project uses. Those
   stores (plus pnpm's default location) become `DirKind::PnpmStore` rows,
   deduplicated by canonical path and sized after all projects. Deleting one in

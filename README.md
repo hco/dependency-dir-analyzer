@@ -198,6 +198,11 @@ dda reports two sizes per directory:
   counted. Clones are tracked per file with APFS's clone id and reference count
   (macOS only; other volumes treat every file as its own).
 
+On macOS, dda reads each directory's file sizes, link counts and clone ids
+in bulk with `getattrlistbulk`, so this costs no more time than summing plain
+file lengths. Volumes that don't support it, and `--follow-symlinks`, fall
+back to one call per file.
+
 The TUI and plain table show **freeable** by default; `f` or `--size-mode
 allocated` switches to on disk. Rows marked `⇄` are mostly shared: deleting
 them frees less than half of what they occupy. Summed totals are a guide, not

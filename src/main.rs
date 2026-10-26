@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+mod bulk;
 mod cli;
 mod pnpm;
 mod report;

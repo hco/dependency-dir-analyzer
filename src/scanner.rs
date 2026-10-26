@@ -10,7 +10,7 @@ use walkdir::WalkDir;
 
 use crate::pnpm;
 use crate::state::SizeMode;
-use crate::usage::{file_info, Usage, UsageAccumulator};
+use crate::usage::{file_info, FileInfo, Usage, UsageAccumulator};
 
 /// What a reported directory is, which decides how it is cleaned up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -542,11 +542,61 @@ fn directory_stats(
     follow_symlinks: bool,
     cancel: &AtomicBool,
 ) -> (Usage, u64, Option<SystemTime>) {
-    // Following symlinks can reach the same inode by several paths, so every
-    // inode must be counted once, not only hardlinked ones.
-    let mut usage = UsageAccumulator::new(follow_symlinks);
-    let mut count = 0u64;
-    let mut newest: Option<SystemTime> = None;
+    let mut tally = Tally::new(follow_symlinks);
+    // `getattrlistbulk` reads a whole directory's attributes per call instead
+    // of one `lstat` + `getattrlist` per file, which dominates sizing time on
+    // large trees. It can't follow symlinks, so that mode keeps walkdir.
+    #[cfg(target_os = "macos")]
+    if !follow_symlinks {
+        bulk_into(&mut tally, dir, cancel);
+        return tally.finish();
+    }
+    walk_into(&mut tally, dir, follow_symlinks, cancel);
+    tally.finish()
+}
+
+/// Running totals for [`directory_stats`].
+struct Tally {
+    usage: UsageAccumulator,
+    count: u64,
+    newest: Option<SystemTime>,
+}
+
+impl Tally {
+    fn new(follow_symlinks: bool) -> Self {
+        Self {
+            // Following symlinks can reach the same inode by several paths, so
+            // every inode must be counted once, not only hardlinked ones.
+            usage: UsageAccumulator::new(follow_symlinks),
+            count: 0,
+            newest: None,
+        }
+    }
+
+    /// Count a regular file; `linked` when it was reached through a symlink.
+    fn file(&mut self, info: FileInfo, linked: bool) {
+        if linked {
+            self.usage.add_linked(info);
+        } else {
+            self.usage.add(info);
+        }
+        self.count += 1;
+    }
+
+    fn modified(&mut self, modified: SystemTime) {
+        self.newest = Some(match self.newest {
+            Some(current) if current >= modified => current,
+            _ => modified,
+        });
+    }
+
+    fn finish(self) -> (Usage, u64, Option<SystemTime>) {
+        (self.usage.finish(), self.count, self.newest)
+    }
+}
+
+/// Add `dir` and everything beneath it to `tally` using walkdir.
+fn walk_into(tally: &mut Tally, dir: &Path, follow_symlinks: bool, cancel: &AtomicBool) {
     // Depth of the followed directory symlink we are currently beneath, if
     // any: everything under it lives elsewhere and survives deleting `dir`.
     let mut linked_below: Option<usize> = None;
@@ -570,24 +620,30 @@ fn directory_stats(
         }
         if let Ok(meta) = entry.metadata() {
             if entry.file_type().is_file() {
-                let info = file_info(entry.path(), &meta);
-                if linked {
-                    usage.add_linked(info);
-                } else {
-                    usage.add(info);
-                }
-                count += 1;
+                tally.file(file_info(entry.path(), &meta), linked);
             }
             if let Ok(modified) = meta.modified() {
-                newest = Some(match newest {
-                    Some(current) if current >= modified => current,
-                    _ => modified,
-                });
+                tally.modified(modified);
             }
         }
     }
+}
 
-    (usage.finish(), count, newest)
+/// Add `dir` and everything beneath it to `tally` using `getattrlistbulk`,
+/// falling back to walkdir for any directory whose volume doesn't support it.
+#[cfg(target_os = "macos")]
+fn bulk_into(tally: &mut Tally, dir: &Path, cancel: &AtomicBool) {
+    use crate::bulk::{walk, Visit};
+
+    // Like walkdir, count the root's own mtime (without following it).
+    if let Ok(modified) = std::fs::symlink_metadata(dir).and_then(|m| m.modified()) {
+        tally.modified(modified);
+    }
+    walk(dir, cancel, &mut |visit| match visit {
+        Visit::File(info) => tally.file(info, false),
+        Visit::Modified(modified) => tally.modified(modified),
+        Visit::Unsupported(path) => walk_into(tally, path, false, cancel),
+    });
 }
 
 #[cfg(test)]
@@ -919,6 +975,51 @@ mod tests {
         assert_eq!(dir.bytes(SizeMode::Freeable), 600);
         assert_eq!(dir.bytes(SizeMode::Allocated), 1000);
         assert!(!dir.mostly_shared());
+    }
+
+    /// The `getattrlistbulk` walk must measure exactly what walkdir does:
+    /// hardlinks, clones, symlinks, nesting and directories big enough to take
+    /// several bulk calls.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bulk_walk_matches_walkdir() {
+        let tmp = std::env::temp_dir().join(format!("dda-test-{}-bulk", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let deep = tmp.join("a").join("b").join("c");
+        fs::create_dir_all(&deep).unwrap();
+        fs::create_dir_all(tmp.join("empty")).unwrap();
+        fs::write(deep.join("data"), vec![1u8; 100 * 1024]).unwrap();
+        fs::hard_link(deep.join("data"), tmp.join("a").join("link")).unwrap();
+        let outside =
+            std::env::temp_dir().join(format!("dda-test-{}-bulk-out", std::process::id()));
+        fs::write(&outside, vec![2u8; 50 * 1024]).unwrap();
+        fs::hard_link(&outside, tmp.join("shared")).unwrap();
+        let status = std::process::Command::new("cp")
+            .arg("-c")
+            .arg(deep.join("data"))
+            .arg(tmp.join("clone"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::os::unix::fs::symlink(deep.join("data"), tmp.join("sym")).unwrap();
+        std::os::unix::fs::symlink(&deep, tmp.join("dirsym")).unwrap();
+        let many = tmp.join("many");
+        fs::create_dir(&many).unwrap();
+        for i in 0..2000 {
+            fs::write(many.join(format!("file-with-a-longish-name-{i}")), b"x").unwrap();
+        }
+
+        let cancel = AtomicBool::new(false);
+        let mut walked = Tally::new(false);
+        walk_into(&mut walked, &tmp, false, &cancel);
+        let mut bulk = Tally::new(false);
+        bulk_into(&mut bulk, &tmp, &cancel);
+        let (walked, bulk) = (walked.finish(), bulk.finish());
+        assert_eq!(walked.1, 2004);
+        assert_eq!(bulk, walked);
+
+        let _ = fs::remove_dir_all(&tmp);
+        let _ = fs::remove_file(&outside);
     }
 
     #[test]
