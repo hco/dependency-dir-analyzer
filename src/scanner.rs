@@ -452,21 +452,37 @@ pub(crate) fn collect_stores(
         .filter_map(|m| m.canonicalize().ok())
         .collect();
     let mut seen = std::collections::HashSet::new();
+    // Rows name the resolved store: a path ending in a link would otherwise
+    // be deleted as just the link, and a relative one shows its `..`.
     candidates
         .into_iter()
-        .filter(|path| {
-            let Ok(canonical) = path.canonicalize() else {
-                return false;
-            };
+        .filter_map(|path| path.canonicalize().ok())
+        .filter(|canonical| {
             // Neither inside a matched directory (that row counts it) nor
             // around one (then it is a project tree, not a store).
-            pnpm::looks_like_store(&canonical)
+            pnpm::looks_like_store(canonical)
                 && !matched
                     .iter()
-                    .any(|m| canonical.starts_with(m) || m.starts_with(&canonical))
-                && seen.insert(canonical)
+                    .any(|m| canonical.starts_with(m) || m.starts_with(canonical))
+                && seen.insert(canonical.clone())
         })
+        .map(without_verbatim_prefix)
         .collect()
+}
+
+/// `path` without the `\\?\` prefix Windows' `canonicalize` adds, where
+/// the path means the same without it (a drive letter or a UNC share).
+fn without_verbatim_prefix(path: PathBuf) -> PathBuf {
+    let Some(text) = path.to_str() else {
+        return path;
+    };
+    if let Some(share) = text.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{share}"));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) if rest.as_bytes().get(1) == Some(&b':') => PathBuf::from(rest),
+        _ => path,
+    }
 }
 
 /// Size a pnpm store into a row of its own. Never following symlinks, even
@@ -737,6 +753,11 @@ mod tests {
         fs::write(store.join("files").join("00").join("blob"), vec![7u8; 4096]).unwrap();
     }
 
+    /// How a store row names `store`.
+    fn resolved(store: &Path) -> PathBuf {
+        without_verbatim_prefix(store.canonicalize().unwrap())
+    }
+
     fn fresh_dir(tag: &str) -> PathBuf {
         let tmp = std::env::temp_dir().join(format!("dda-test-{}-{tag}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
@@ -758,7 +779,7 @@ mod tests {
             .filter(|d| d.kind == DirKind::PnpmStore)
             .collect();
         assert_eq!(stores.len(), 1, "{results:?}");
-        assert_eq!(stores[0].path, store);
+        assert_eq!(stores[0].path, resolved(&store));
         assert_eq!(stores[0].ecosystem, crate::pnpm::STORE_ECOSYSTEM);
         assert!(stores[0].allocated_bytes >= 4096);
 
@@ -785,6 +806,51 @@ mod tests {
         assert_eq!(stores, 1, "{results:?}");
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn store_rows_use_the_resolved_path() {
+        // A link as the last component, or a relative `storeDir`, still names
+        // the store itself: deleting the row must not just drop a link.
+        let tmp = fresh_dir("store-resolved");
+        let root = tmp.join("root");
+        let store = tmp.join("disk").join("v10");
+        make_store(&store);
+        std::os::unix::fs::symlink(&store, tmp.join("v10")).unwrap();
+        pnpm_project(&root, "linked", &tmp.join("v10"));
+        let relative = tmp.join("near").join("v10");
+        make_store(&relative);
+        pnpm_project(&root, "relative", Path::new("../../../near/v10"));
+
+        let results = scan(&root, &ScanOptions::default());
+        let mut stores: Vec<_> = results
+            .iter()
+            .filter(|d| d.kind == DirKind::PnpmStore)
+            .map(|d| d.path.clone())
+            .collect();
+        stores.sort();
+        let mut expected = [resolved(&store), resolved(&relative)];
+        expected.sort();
+        assert_eq!(stores, expected, "{results:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn verbatim_prefixes_are_dropped_from_store_paths() {
+        let plain = |p: &str| without_verbatim_prefix(PathBuf::from(p));
+        assert_eq!(plain(r"\\?\C:\pnpm\v10"), PathBuf::from(r"C:\pnpm\v10"));
+        assert_eq!(
+            plain(r"\\?\UNC\server\share\v10"),
+            PathBuf::from(r"\\server\share\v10")
+        );
+        // Without a drive letter the prefix is needed, so it stays.
+        assert_eq!(
+            plain(r"\\?\Volume{1}\v10"),
+            PathBuf::from(r"\\?\Volume{1}\v10")
+        );
+        assert_eq!(plain("/Users/me/v10"), PathBuf::from("/Users/me/v10"));
     }
 
     #[test]
@@ -888,11 +954,11 @@ mod tests {
                 .filter(|d| d.kind == DirKind::PnpmStore)
                 .collect();
             assert_eq!(stores.len(), 1, "{results:?}");
-            assert_eq!(stores[0].path, store);
+            assert_eq!(stores[0].path, resolved(&store));
             assert!(
                 results
                     .iter()
-                    .all(|d| !d.path.starts_with(&store) || d.path == store),
+                    .all(|d| d.kind == DirKind::PnpmStore || !d.path.starts_with(&store)),
                 "{results:?}"
             );
         }
