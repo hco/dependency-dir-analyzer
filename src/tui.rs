@@ -2293,21 +2293,34 @@ fn view_to_save(
 /// Delete (or, for a pnpm store that [`store_action_for`] says to prune,
 /// prune) one marked directory, for the deletion worker.
 fn delete_target(dir: DependencyDir, store_action: StoreAction, follow: bool) -> DeleteOutcome {
+    let mut target = dir.path.clone();
     if dir.kind == DirKind::PnpmStore {
         if store_action_for(&dir.path, store_action) == StoreAction::Prune {
             return prune_store(dir, follow);
         }
         // Re-checked right before removing: store paths come from files in
         // the scanned tree, so never remove one that isn't laid out as a store.
-        if !pnpm::looks_like_store(&dir.path) {
-            return DeleteOutcome::Failed {
-                path: dir.path,
-                verb: "delete",
-                error: "does not look like a pnpm store".to_string(),
-            };
+        // Resolved once, so links in the path cannot point the check at one
+        // directory and the removal at another.
+        match dir.path.canonicalize() {
+            Ok(real) if pnpm::looks_like_store(&real) => target = real,
+            Ok(_) => {
+                return DeleteOutcome::Failed {
+                    path: dir.path,
+                    verb: "delete",
+                    error: "does not look like a pnpm store".to_string(),
+                }
+            }
+            Err(e) => {
+                return DeleteOutcome::Failed {
+                    path: dir.path,
+                    verb: "delete",
+                    error: e.to_string(),
+                }
+            }
         }
     }
-    match std::fs::remove_dir_all(&dir.path) {
+    match std::fs::remove_dir_all(&target) {
         Ok(()) => DeleteOutcome::Removed {
             size: dir.freeable_bytes,
             path: dir.path,
@@ -3123,6 +3136,34 @@ mod tests {
 
         assert!(not_store.join("precious").exists());
         assert_eq!(app.warnings, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_linked_store_checks_and_removes_the_same_dir() {
+        // The scan accepts a store by its resolved path, so deletion must
+        // resolve it once too and check and remove that one directory.
+        let tmp = std::env::temp_dir().join(format!("dda-store-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("real").join("v10");
+        std::fs::create_dir_all(store.join("files").join("00")).unwrap();
+        std::fs::create_dir_all(store.join("index")).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+
+        let outcome = delete_target(
+            store_dir_row(link.clone(), 1, 1),
+            StoreAction::Delete,
+            false,
+        );
+
+        match outcome {
+            DeleteOutcome::Removed { path, .. } => assert_eq!(path, link),
+            DeleteOutcome::Failed { error, .. } => panic!("not removed: {error}"),
+            DeleteOutcome::Pruned { .. } => panic!("pruned instead of deleted"),
+        }
+        assert!(!store.exists());
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
