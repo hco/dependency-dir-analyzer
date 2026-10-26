@@ -343,11 +343,7 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<DependencyDir> {
         .into_par_iter()
         .map(|(path, pattern)| size_match(path, pattern, opts.follow_symlinks, &never))
         .collect();
-    results.par_extend(
-        stores
-            .into_par_iter()
-            .map(|path| size_store(path, opts.follow_symlinks, &never)),
-    );
+    results.par_extend(stores.into_par_iter().map(|path| size_store(path, &never)));
 
     sort_by_size(&mut results, SizeMode::Freeable);
     results
@@ -417,7 +413,7 @@ pub fn scan_streaming(
             });
             let tx = tx.clone();
             scope.spawn(move |_| {
-                let dir = size_store(path, follow, cancel);
+                let dir = size_store(path, cancel);
                 let _ = tx.send(ScanEvent::Sized(dir));
             });
         }
@@ -473,14 +469,16 @@ pub(crate) fn collect_stores(
         .collect()
 }
 
-/// Size a pnpm store into a row of its own.
-fn size_store(path: PathBuf, follow_symlinks: bool, cancel: &AtomicBool) -> DependencyDir {
+/// Size a pnpm store into a row of its own. Never following symlinks, even
+/// with `--follow-symlinks`: `projects/` links to every registered project
+/// root, and pnpm 11's `links/` is what projects link to, not the reverse.
+pub(crate) fn size_store(path: PathBuf, cancel: &AtomicBool) -> DependencyDir {
     size_dir(
         path,
         DirKind::PnpmStore,
         pnpm::STORE_ECOSYSTEM,
         pnpm::STORE_ECOSYSTEM,
-        follow_symlinks,
+        false,
         cancel,
     )
 }
@@ -503,7 +501,7 @@ fn size_match(
 }
 
 /// Measure `path` into a [`DependencyDir`] row of the given kind and labels.
-pub(crate) fn size_dir(
+fn size_dir(
     path: PathBuf,
     kind: DirKind,
     ecosystem: &'static str,
@@ -926,6 +924,36 @@ mod tests {
         assert_eq!(results.len(), 1, "{results:?}");
         assert!(results[0].allocated_bytes >= 128 * 1024, "{results:?}");
         assert_eq!(results[0].freeable_bytes, 0, "{results:?}");
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stores_are_sized_without_following_their_project_links() {
+        // `projects/` links to every registered project root; following
+        // them would add whole source trees to the store row.
+        let tmp = fresh_dir("store-follow");
+        let root = tmp.join("root");
+        let store = root.join("pnpm").join("v11");
+        make_store(&store);
+        fs::create_dir_all(store.join("projects")).unwrap();
+        let elsewhere = tmp.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("big.bin"), vec![1u8; 256 * 1024]).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, store.join("projects").join("x")).unwrap();
+
+        let store_row = |follow_symlinks| {
+            let opts = ScanOptions {
+                follow_symlinks,
+                ..Default::default()
+            };
+            let results = scan(&root, &opts);
+            let row = results.into_iter().find(|d| d.kind == DirKind::PnpmStore);
+            row.map(|d| (d.allocated_bytes, d.file_count))
+        };
+        assert!(store_row(false).is_some());
+        assert_eq!(store_row(true), store_row(false));
 
         let _ = fs::remove_dir_all(&tmp);
     }

@@ -108,7 +108,6 @@ pub fn run(
     let settings = state::settings();
     app.trash_notice_pending = !settings.trash_removal_acknowledged;
     app.store_action = settings.store_action;
-    app.follow_symlinks = opts.follow_symlinks;
     app.snapshots = crate::usage::has_local_snapshots();
     let result = app.event_loop(&mut terminal, rx);
     if mouse {
@@ -369,9 +368,6 @@ struct App {
     /// What deleting a marked pnpm store does. Remembered globally; [`run`]
     /// loads it from the settings.
     store_action: StoreAction,
-    /// Whether the scan follows symlinks, so a pruned store is re-measured
-    /// the same way it was measured.
-    follow_symlinks: bool,
 }
 
 impl App {
@@ -407,7 +403,6 @@ impl App {
             trash_notice_pending: false,
             snapshots: false,
             store_action: StoreAction::default(),
-            follow_symlinks: false,
         }
     }
 
@@ -998,7 +993,6 @@ impl App {
         // packages only those just-deleted projects were holding on to.
         targets.sort_by_key(|d| d.kind == DirKind::PnpmStore);
         let store_action = self.store_action;
-        let follow = self.follow_symlinks;
         self.action = None;
         self.delete_progress = Some(DeleteProgress {
             done: 0,
@@ -1012,7 +1006,7 @@ impl App {
         self.delete_rx = Some(rx);
         thread::spawn(move || {
             for dir in targets {
-                let outcome = delete_target(dir, store_action, follow);
+                let outcome = delete_target(dir, store_action);
                 // The UI hung up (quit): stop early, nothing left to report to.
                 if tx.send(outcome).is_err() {
                     break;
@@ -2292,11 +2286,11 @@ fn view_to_save(
 
 /// Delete (or, for a pnpm store that [`store_action_for`] says to prune,
 /// prune) one marked directory, for the deletion worker.
-fn delete_target(dir: DependencyDir, store_action: StoreAction, follow: bool) -> DeleteOutcome {
+fn delete_target(dir: DependencyDir, store_action: StoreAction) -> DeleteOutcome {
     let mut target = dir.path.clone();
     if dir.kind == DirKind::PnpmStore {
         if store_action_for(&dir.path, store_action) == StoreAction::Prune {
-            return prune_store(dir, follow);
+            return prune_store(dir);
         }
         // Re-checked right before removing: store paths come from files in
         // the scanned tree, so never remove one that isn't laid out as a store.
@@ -2346,18 +2340,11 @@ fn store_action_for(store: &Path, chosen: StoreAction) -> StoreAction {
 }
 
 /// Prune a marked pnpm store and re-measure it, for the deletion worker.
-fn prune_store(old: DependencyDir, follow_symlinks: bool) -> DeleteOutcome {
+fn prune_store(old: DependencyDir) -> DeleteOutcome {
     match pnpm::prune(&old.path) {
         Ok(()) => {
             let never = AtomicBool::new(false);
-            let new = scanner::size_dir(
-                old.path.clone(),
-                DirKind::PnpmStore,
-                pnpm::STORE_ECOSYSTEM,
-                pnpm::STORE_ECOSYSTEM,
-                follow_symlinks,
-                &never,
-            );
+            let new = scanner::size_store(old.path.clone(), &never);
             DeleteOutcome::Pruned { old, new }
         }
         Err(error) => DeleteOutcome::Failed {
@@ -3152,11 +3139,7 @@ mod tests {
         let link = tmp.join("link");
         std::os::unix::fs::symlink(&store, &link).unwrap();
 
-        let outcome = delete_target(
-            store_dir_row(link.clone(), 1, 1),
-            StoreAction::Delete,
-            false,
-        );
+        let outcome = delete_target(store_dir_row(link.clone(), 1, 1), StoreAction::Delete);
 
         match outcome {
             DeleteOutcome::Removed { path, .. } => assert_eq!(path, link),
