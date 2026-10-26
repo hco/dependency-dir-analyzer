@@ -193,10 +193,12 @@ dda reports two sizes per directory:
   file hardlinked several times inside the directory counts once.
 - **Freeable** (`freeable_bytes`) — what deleting the directory would actually
   give back. A file that is also reachable from outside the directory, through
-  a hardlink (pnpm on Linux, Windows) or as an APFS clone (pnpm on macOS) whose
-  other copies live elsewhere, stays on disk after the delete and is not
-  counted. Clones are tracked per file with APFS's clone id and reference count
-  (macOS only; other volumes treat every file as its own).
+  a hardlink (pnpm on Linux) or as an APFS clone (pnpm on macOS) whose other
+  copies live elsewhere, stays on disk after the delete and is not counted.
+  Clones are tracked per file with APFS's clone id and reference count (macOS
+  only; other volumes treat every file as its own). On Windows dda can't tell
+  hardlinks apart, so every file counts as the directory's own and freeable
+  equals on disk; pnpm's hardlinked `node_modules` look fully freeable there.
 
 On macOS, dda reads each directory's file sizes, link counts and clone ids
 in bulk with `getattrlistbulk`, so this costs no more time than summing plain

@@ -28,8 +28,9 @@ pub struct CloneInfo {
 pub struct FileInfo {
     /// Bytes actually allocated on disk (`st_blocks * 512`), not the length.
     pub allocated: u64,
-    pub dev: u64,
-    pub ino: u64,
+    /// `(dev, ino)`, or `None` where the platform can't say which files are
+    /// the same one (Windows): such files are never merged with each other.
+    pub id: Option<(u64, u64)>,
     pub nlink: u64,
     /// `None` when the volume doesn't track clones (or on non-macOS).
     pub clone: Option<CloneInfo>,
@@ -51,8 +52,9 @@ pub struct UsageAccumulator {
     usage: Usage,
     /// Multiply-referenced inodes: `(dev, ino)` → (links seen directly, info).
     inodes: HashMap<(u64, u64), (u64, FileInfo)>,
-    /// Clone families: id → (members seen, refcnt, largest allocation).
-    clones: HashMap<u64, (u32, u32, u64)>,
+    /// Clone families: (dev, clone id) → (members seen, refcnt, largest
+    /// allocation). Clone ids are only unique within one volume.
+    clones: HashMap<(u64, u64), (u32, u32, u64)>,
 }
 
 impl UsageAccumulator {
@@ -67,27 +69,36 @@ impl UsageAccumulator {
     }
 
     pub fn add(&mut self, f: FileInfo) {
-        if f.nlink > 1 || self.dedupe_all_inodes {
-            // Size each inode once; whether it is freeable depends on whether
-            // all of its links turn up inside this tree, known only at the end.
-            self.track_inode(f).0 += 1;
-            return;
+        match f.id {
+            Some(id) if f.nlink > 1 || self.dedupe_all_inodes => {
+                // Size each inode once; whether it is freeable depends on
+                // whether all of its links turn up inside this tree, known
+                // only at the end.
+                self.track_inode(id, f).0 += 1;
+            }
+            _ => {
+                self.usage.allocated += f.allocated;
+                self.add_freeable(f);
+            }
         }
-        self.usage.allocated += f.allocated;
-        self.add_freeable(f);
     }
 
     /// Add a file reached through a followed symlink. It occupies space, but
     /// deleting the tree removes only the link, so unless the same inode is
     /// also reached directly it is never freeable.
     pub fn add_linked(&mut self, f: FileInfo) {
-        self.track_inode(f);
+        match f.id {
+            Some(id) => {
+                self.track_inode(id, f);
+            }
+            None => self.usage.allocated += f.allocated,
+        }
     }
 
-    /// The tracking entry for `f`'s inode, counting its bytes the first time.
-    fn track_inode(&mut self, f: FileInfo) -> &mut (u64, FileInfo) {
+    /// The tracking entry for inode `id`, counting `f`'s bytes the first time.
+    fn track_inode(&mut self, id: (u64, u64), f: FileInfo) -> &mut (u64, FileInfo) {
         let usage = &mut self.usage;
-        self.inodes.entry((f.dev, f.ino)).or_insert_with(|| {
+        self.inodes.entry(id).or_insert_with(|| {
             usage.allocated += f.allocated;
             (0, f)
         })
@@ -114,7 +125,8 @@ impl UsageAccumulator {
     fn add_freeable(&mut self, f: FileInfo) {
         match f.clone {
             Some(c) if c.refcnt > 1 => {
-                let family = self.clones.entry(c.id).or_insert((0, c.refcnt, 0));
+                let dev = f.id.map_or(0, |(dev, _)| dev);
+                let family = self.clones.entry((dev, c.id)).or_insert((0, c.refcnt, 0));
                 family.0 += 1;
                 family.2 = family.2.max(f.allocated);
             }
@@ -130,8 +142,7 @@ pub fn file_info(path: &Path, meta: &std::fs::Metadata) -> FileInfo {
     use std::os::unix::fs::MetadataExt;
     FileInfo {
         allocated: meta.blocks() * 512,
-        dev: meta.dev(),
-        ino: meta.ino(),
+        id: Some((meta.dev(), meta.ino())),
         nlink: meta.nlink(),
         clone: clone_info(path),
     }
@@ -143,8 +154,7 @@ pub fn file_info(path: &Path, meta: &std::fs::Metadata) -> FileInfo {
 pub fn file_info(_path: &Path, meta: &std::fs::Metadata) -> FileInfo {
     FileInfo {
         allocated: meta.len(),
-        dev: 0,
-        ino: 0,
+        id: None,
         nlink: 1,
         clone: None,
     }
@@ -239,10 +249,19 @@ mod tests {
     fn f(allocated: u64, ino: u64, nlink: u64, clone: Option<(u64, u32)>) -> FileInfo {
         FileInfo {
             allocated,
-            dev: 1,
-            ino,
+            id: Some((1, ino)),
             nlink,
             clone: clone.map(|(id, refcnt)| CloneInfo { id, refcnt }),
+        }
+    }
+
+    /// A file without a known identity, as Windows reports every file.
+    fn anonymous(allocated: u64) -> FileInfo {
+        FileInfo {
+            allocated,
+            id: None,
+            nlink: 1,
+            clone: None,
         }
     }
 
@@ -324,6 +343,42 @@ mod tests {
         assert_eq!(usage(true, &files), u(4096, 4096));
     }
 
+    #[test]
+    fn files_without_identity_are_never_merged() {
+        let files = [anonymous(4096), anonymous(8192), anonymous(4096)];
+        assert_eq!(usage(false, &files), u(16384, 16384));
+        // Following symlinks dedupes by inode, which needs an identity.
+        assert_eq!(usage(true, &files), u(16384, 16384));
+    }
+
+    #[test]
+    fn files_without_identity_reached_through_a_symlink_are_not_freeable() {
+        let mut acc = UsageAccumulator::new(true);
+        acc.add_linked(anonymous(4096));
+        acc.add_linked(anonymous(8192));
+        assert_eq!(acc.finish(), u(12288, 0));
+    }
+
+    #[test]
+    fn clone_ids_only_match_on_the_same_volume() {
+        let mut a = f(4096, 1, 1, Some((99, 2)));
+        let mut b = f(4096, 1, 1, Some((99, 2)));
+        a.id = Some((1, 1));
+        b.id = Some((2, 1));
+        // Each is one member of a two-member family on its own volume.
+        assert_eq!(usage(false, &[a, b]), u(8192, 0));
+    }
+
+    #[test]
+    fn hardlinked_clone_counts_once_and_frees_with_its_family() {
+        // Inode 7 has two links and a clone (inode 8) beside it.
+        let linked = f(4096, 7, 2, Some((99, 2)));
+        let clone = f(4096, 8, 1, Some((99, 2)));
+        assert_eq!(usage(false, &[linked, linked, clone]), u(8192, 4096));
+        // One link lives outside: its blocks stay, and so do the clone's.
+        assert_eq!(usage(false, &[linked, clone]), u(8192, 0));
+    }
+
     #[cfg(unix)]
     fn scratch(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("dda-usage-{tag}-{}", std::process::id()));
@@ -348,7 +403,7 @@ mod tests {
 
         let (ia, ib) = (info(&a), info(&dir.join("b")));
         assert_eq!(ia.nlink, 2);
-        assert_eq!(ia.ino, ib.ino);
+        assert_eq!(ia.id, ib.id);
         assert!(ia.allocated >= 64 * 1024);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -372,7 +427,7 @@ mod tests {
         let (ca, cb) = (ia.clone.unwrap(), ib.clone.unwrap());
         assert_eq!(ca.id, cb.id);
         assert_eq!(ca.refcnt, 2);
-        assert_ne!(ia.ino, ib.ino);
+        assert_ne!(ia.id, ib.id);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

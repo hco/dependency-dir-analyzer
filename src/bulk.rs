@@ -201,8 +201,10 @@ fn file_info(e: &[u8]) -> FileInfo {
     FileInfo {
         allocated: read_u64(e, offset::ALLOCATED).unwrap_or(0),
         // `dev_t` is an i32; widen it the way std's `MetadataExt::dev` does.
-        dev: read_u32(e, offset::DEV).unwrap_or(0) as i32 as u64,
-        ino: read_u64(e, offset::INO).unwrap_or(0),
+        id: Some((
+            read_u32(e, offset::DEV).unwrap_or(0) as i32 as u64,
+            read_u64(e, offset::INO).unwrap_or(0),
+        )),
         nlink: u64::from(read_u32(e, offset::NLINK).unwrap_or(1)),
         clone,
     }
