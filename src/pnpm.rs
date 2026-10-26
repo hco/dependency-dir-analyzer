@@ -11,8 +11,9 @@ pub const STORE_ECOSYSTEM: &str = "pnpm store";
 ///
 /// pnpm has written this file both as YAML (`storeDir: /p`) and as JSON
 /// (`"storeDir": "/p",`), so rather than pull in a parser this finds the one
-/// line that names the key. A relative path is resolved against `base`, the
-/// `node_modules` directory holding the file.
+/// line that names the key and decodes its (possibly quoted) value. A
+/// relative path is resolved against `base`, the `node_modules` directory
+/// holding the file.
 pub fn parse_store_dir(contents: &str, base: &Path) -> Option<PathBuf> {
     contents.lines().find_map(|line| {
         let rest = line.trim().trim_start_matches('"');
@@ -20,16 +21,85 @@ pub fn parse_store_dir(contents: &str, base: &Path) -> Option<PathBuf> {
         let value = value
             .trim_start_matches('"')
             .trim_start()
-            .strip_prefix(':')?;
-        let value = value
-            .trim()
-            .trim_end_matches(',')
-            .trim_matches(|c| c == '"' || c == '\'');
+            .strip_prefix(':')?
+            .trim();
+        let value = if let Some(quoted) = value.strip_prefix('"') {
+            unquote_double(quoted)?
+        } else if let Some(quoted) = value.strip_prefix('\'') {
+            unquote_single(quoted)?
+        } else {
+            value.trim_end_matches(',').to_string()
+        };
         if value.is_empty() {
             return None;
         }
         Some(base.join(value))
     })
+}
+
+/// Decode a JSON (or YAML double-quoted) string body up to its closing quote:
+/// the Windows form `"C:\\Users\\…"` must lose its doubled backslashes.
+/// `None` for a malformed escape or a missing closing quote.
+fn unquote_double(body: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                c @ ('"' | '\\' | '/') => out.push(c),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let unit = hex4(&mut chars)?;
+                    let units = if (0xd800..0xdc00).contains(&unit) {
+                        // A surrogate pair spells one character in two escapes.
+                        if chars.next()? != '\\' || chars.next()? != 'u' {
+                            return None;
+                        }
+                        vec![unit, hex4(&mut chars)?]
+                    } else {
+                        vec![unit]
+                    };
+                    out.push(char::decode_utf16(units).next()?.ok()?);
+                }
+                _ => return None,
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// The four hex digits of a `\u` escape.
+fn hex4(chars: &mut std::str::Chars) -> Option<u16> {
+    let digits: String = chars.take(4).collect();
+    // `from_str_radix` would also take a leading `+`.
+    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    u16::from_str_radix(&digits, 16).ok()
+}
+
+/// Decode a YAML single-quoted string body up to its closing quote, where a
+/// doubled quote stands for one.
+fn unquote_single(body: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+        } else if chars.peek() == Some(&'\'') {
+            chars.next();
+            out.push('\'');
+        } else {
+            return Some(out);
+        }
+    }
+    None
 }
 
 /// The store the pnpm project owning `node_modules` installed from, if it was
@@ -282,6 +352,33 @@ mod tests {
             parse_store_dir(json, Path::new("/p/node_modules")),
             Some(PathBuf::from("/Users/x/Library/pnpm/store/v11"))
         );
+    }
+
+    #[test]
+    fn parse_store_dir_decodes_windows_json_paths() {
+        let json = "{\n  \"storeDir\": \"C:\\\\Users\\\\me\\\\AppData\\\\Local\\\\pnpm\\\\store\\\\v10\",\n}\n";
+        assert_eq!(
+            parse_store_dir(json, Path::new("/p/node_modules")),
+            Some(Path::new("/p/node_modules").join(r"C:\Users\me\AppData\Local\pnpm\store\v10"))
+        );
+    }
+
+    #[test]
+    fn parse_store_dir_decodes_quoted_escapes() {
+        let base = Path::new("/p");
+        let dq = "\"storeDir\": \"/s/a\\\"b\\/c\\u00e9\\ud83d\\ude00\",\n";
+        assert_eq!(
+            parse_store_dir(dq, base),
+            Some(PathBuf::from("/s/a\"b/c\u{e9}\u{1f600}"))
+        );
+        // YAML single quotes escape a quote by doubling it.
+        assert_eq!(
+            parse_store_dir("storeDir: '/s/it''s'\n", base),
+            Some(PathBuf::from("/s/it's"))
+        );
+        // A broken escape is not a path to trust.
+        assert_eq!(parse_store_dir("storeDir: \"/s/\\u12\"\n", base), None);
+        assert_eq!(parse_store_dir("storeDir: \"/s/open\n", base), None);
     }
 
     #[test]
