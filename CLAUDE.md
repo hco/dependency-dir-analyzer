@@ -87,7 +87,7 @@ mise.toml       # toolchain + tasks
   `getattrlist` remains for `--follow-symlinks` and unsupported volumes.
 - `node_modules/.modules.yaml` names the pnpm store a project uses. Those
   stores (plus pnpm's default location) become `DirKind::PnpmStore` rows,
-  deduplicated by canonical path and sized after all projects. Deleting one in
+  named and deduplicated by canonical path and sized after all projects. Deleting one in
   the TUI runs `pnpm store prune` by default (`StoreAction`).
 - There are two entry points: `scan` returns the full sorted `Vec` in one shot
   (used by the JSON/CSV/plain paths and tests), and `scan_streaming` sends
