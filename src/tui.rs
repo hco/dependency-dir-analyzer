@@ -1568,7 +1568,7 @@ impl App {
 
         let widths = [
             Constraint::Length(1),
-            // Room for `12,300 MB ⇄`.
+            // Room for `≤ 12,300 MB ⇄`.
             Constraint::Length(14),
             Constraint::Length(bar_width as u16),
             Constraint::Length(10),
@@ -2029,6 +2029,8 @@ impl App {
         let (store_dirs, other_dirs): (Vec<_>, Vec<_>) =
             dirs.iter().partition(|(p, _)| stores.contains(p.as_path()));
         let any_store = !store_dirs.is_empty();
+        let bounded = |p: &Path| freeable_is_upper_bound(DirKind::PnpmStore, p);
+        let any_bound = store_dirs.iter().any(|(p, _)| bounded(p));
         let prunes = store_dirs
             .iter()
             .filter(|(p, _)| store_action_for(p, self.store_action) == StoreAction::Prune)
@@ -2060,8 +2062,12 @@ impl App {
         )));
         lines.push(Line::raw(""));
         for (path, size) in store_dirs.iter().chain(other_dirs.iter().take(MAX_LISTED)) {
+            let mut size = self.fmt_size(*size);
+            if stores.contains(path.as_path()) && bounded(path) {
+                size = format!("≤ {size}");
+            }
             let mut line = vec![Span::styled(
-                format!("  {:>9}  ", self.fmt_size(*size)),
+                format!("  {size:>9}  "),
                 Style::new().fg(Color::Gray),
             )];
             // Say what happens to a store before its (possibly cut off) path.
@@ -2094,7 +2100,14 @@ impl App {
 
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("Reclaims ", Style::new().fg(Color::Gray)),
+            Span::styled(
+                if any_bound {
+                    "Reclaims up to "
+                } else {
+                    "Reclaims "
+                },
+                Style::new().fg(Color::Gray),
+            ),
             Span::styled(self.fmt_size(bytes), Style::new().fg(Color::Green).bold()),
             Span::styled(" of disk space.", Style::new().fg(Color::Gray)),
         ]));
@@ -2240,7 +2253,10 @@ impl App {
     /// A row's size in the current mode, flagged with `⇄` when deleting it
     /// would free little because most of it is shared outside.
     fn size_cell(&self, d: &DependencyDir) -> String {
-        let size = self.fmt_size(d.bytes(self.size_mode));
+        let mut size = self.fmt_size(d.bytes(self.size_mode));
+        if self.size_mode == SizeMode::Freeable && freeable_is_upper_bound(d.kind, &d.path) {
+            size = format!("≤ {size}");
+        }
         if d.mostly_shared() {
             format!("{size} ⇄")
         } else {
@@ -2265,6 +2281,13 @@ impl App {
             Err(_) => path.display().to_string(),
         }
     }
+}
+
+/// Whether a row's freeable size only bounds what removing it frees: pnpm
+/// 11 projects symlink to packages in a store's `links/`, which the sizing
+/// counts as freeable but `pnpm store prune` keeps.
+fn freeable_is_upper_bound(kind: DirKind, path: &Path) -> bool {
+    kind == DirKind::PnpmStore && pnpm::projects_link_into(path)
 }
 
 /// The view to remember for next time: what the TUI ended on, except that a
@@ -2915,6 +2938,34 @@ mod tests {
         assert!(!out.contains("DELETE whole store"), "{out}");
         assert!(out.contains("prune"), "{out}");
         assert!(out.contains("projects link into it"), "{out}");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    #[test]
+    fn linked_store_freeable_is_shown_as_an_upper_bound() {
+        // Packages projects symlink to count as freeable, yet prune keeps
+        // them, so the figure is only an upper bound.
+        let store = linked_store("linked-bound");
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 900, 800)));
+        assert!(screen(&mut app, 160, 30).contains("≤ "));
+        app.size_mode = SizeMode::Allocated;
+        assert!(!screen(&mut app, 160, 30).contains("≤ "));
+
+        app.size_mode = SizeMode::Freeable;
+        app.selected.insert(store.clone());
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let out = screen(&mut app, 160, 30);
+        assert!(out.contains("Reclaims up to "), "{out}");
+        assert!(out.contains("≤ "), "{out}");
+
+        // Without `links/` prune frees what the row says.
+        std::fs::remove_dir_all(store.join("links")).unwrap();
+        let out = screen(&mut app, 160, 30);
+        assert!(!out.contains("up to"), "{out}");
+        assert!(!out.contains("≤ "), "{out}");
         let _ = std::fs::remove_dir_all(store.parent().unwrap());
     }
 

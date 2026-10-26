@@ -222,8 +222,12 @@ every project's `node_modules` (pnpm 11 symlinks them from the store's
 `links/` instead). dda reads each `node_modules/.modules.yaml` to
 find the stores in use and lists each one once (including pnpm's default
 location, unless `--no-pnpm-default-store` or the `pnpm_default_store`
-setting turns that off). A store's freeable size is roughly what
-`pnpm store prune` can reclaim: packages no project points at anymore.
+setting turns that off). For pnpm 10 and older, a store's freeable size is
+roughly what `pnpm store prune` can reclaim: packages no project points at
+anymore. pnpm 11 projects symlink to packages in the store's `links/`, and
+dda doesn't follow those links back, so for such a store the freeable size
+is only an upper bound; the TUI marks it `≤` and the confirmation dialog says
+"Reclaims up to".
 
 ### Time Machine snapshots
 
