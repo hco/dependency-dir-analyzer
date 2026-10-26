@@ -6,7 +6,7 @@
 //! `node_modules` trees several times faster.
 
 use std::ffi::OsStr;
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
@@ -67,9 +67,20 @@ mod offset {
     pub const FILE_END: usize = 88;
 }
 
-/// Walk everything beneath `root` (not `root` itself), reporting to `visit`.
-/// Unreadable directories are skipped silently, like the walkdir path does.
-pub fn walk(root: &Path, cancel: &AtomicBool, visit: &mut dyn FnMut(Visit<'_>)) {
+/// Reads the next batch of an open directory's entries into the buffer and
+/// returns how many it read, 0 at the end or -1 on failure: [`read_entries`],
+/// or a stand-in in tests.
+pub type Fetch<'f> = dyn FnMut(&File, &mut [u64]) -> i32 + 'f;
+
+/// Walk everything beneath `root` (not `root` itself), reading directories
+/// with `fetch` and reporting to `visit`. Unreadable directories are skipped
+/// silently, like the walkdir path does.
+pub fn walk(
+    root: &Path,
+    cancel: &AtomicBool,
+    visit: &mut dyn FnMut(Visit<'_>),
+    fetch: &mut Fetch<'_>,
+) {
     // u64s so the buffer is as aligned as the kernel could want.
     let mut buf = vec![0u64; 8 * 1024];
     let mut stack = vec![root.to_path_buf()];
@@ -77,17 +88,21 @@ pub fn walk(root: &Path, cancel: &AtomicBool, visit: &mut dyn FnMut(Visit<'_>)) 
         if cancel.load(Ordering::Relaxed) {
             return;
         }
-        read_dir(&dir, &mut buf, cancel, &mut stack, visit);
+        read_dir(&dir, &mut buf, cancel, &mut stack, visit, fetch);
     }
 }
 
 /// Report every entry of `dir`, pushing its subdirectories onto `stack`.
+/// Entries are held back until the whole directory has been read: if any
+/// read fails or comes back malformed, nothing of `dir` has been reported
+/// and it is handed back whole, so nothing is lost or counted twice.
 fn read_dir(
     dir: &Path,
     buf: &mut [u64],
     cancel: &AtomicBool,
     stack: &mut Vec<PathBuf>,
     visit: &mut dyn FnMut(Visit<'_>),
+    fetch: &mut Fetch<'_>,
 ) {
     let Ok(handle) = OpenOptions::new()
         .read(true)
@@ -96,45 +111,60 @@ fn read_dir(
     else {
         return;
     };
+    let buf_len = std::mem::size_of_val(buf);
+
+    let mut found: Vec<Visit<'static>> = Vec::new();
+    let mut subdirs = Vec::new();
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        let count = fetch(&handle, buf);
+        if count < 0 {
+            visit(Visit::Unsupported(dir));
+            return;
+        }
+        if count == 0 {
+            break;
+        }
+        // SAFETY: `buf` is `buf_len` initialised bytes, and u8 has no
+        // alignment or validity requirements.
+        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf_len) };
+        let complete = batch(dir, bytes, count as usize, &mut subdirs, &mut |v| {
+            found.push(match v {
+                Visit::File(info) => Visit::File(info),
+                Visit::Modified(modified) => Visit::Modified(modified),
+                Visit::Unsupported(_) => unreachable!("batches report no directories"),
+            })
+        });
+        if !complete {
+            visit(Visit::Unsupported(dir));
+            return;
+        }
+    }
+    found.into_iter().for_each(visit);
+    stack.append(&mut subdirs);
+}
+
+/// Read the next batch of the open directory `handle` into `buf` with
+/// `getattrlistbulk`.
+pub fn read_entries(handle: &File, buf: &mut [u64]) -> i32 {
     // SAFETY: an all-zero bit pattern is a valid `attrlist`.
     let mut request: libc::attrlist = unsafe { std::mem::zeroed() };
     request.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
     request.commonattr = COMMON;
     request.fileattr = FILE;
     request.forkattr = CLONE;
-    let buf_len = std::mem::size_of_val(buf);
-
-    let mut first = true;
-    loop {
-        if cancel.load(Ordering::Relaxed) {
-            return;
-        }
-        // SAFETY: `handle` is an open directory, `request` is fully
-        // initialised and `buf` is writable for `buf_len` bytes.
-        let count = unsafe {
-            libc::getattrlistbulk(
-                handle.as_raw_fd(),
-                (&mut request as *mut libc::attrlist).cast(),
-                buf.as_mut_ptr().cast(),
-                buf_len,
-                u64::from(libc::FSOPT_ATTR_CMN_EXTENDED | libc::FSOPT_PACK_INVAL_ATTRS),
-            )
-        };
-        if count < 0 && first {
-            // Nothing of `dir` has been reported yet, so it can be handed
-            // back whole.
-            visit(Visit::Unsupported(dir));
-        }
-        if count <= 0 {
-            return;
-        }
-        first = false;
-        // SAFETY: `buf` is `buf_len` initialised bytes, and u8 has no
-        // alignment or validity requirements.
-        let bytes = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf_len) };
-        if !batch(dir, bytes, count as usize, stack, visit) {
-            return;
-        }
+    // SAFETY: `handle` is an open directory, `request` is fully initialised
+    // and `buf` is writable for its whole length.
+    unsafe {
+        libc::getattrlistbulk(
+            handle.as_raw_fd(),
+            (&mut request as *mut libc::attrlist).cast(),
+            buf.as_mut_ptr().cast(),
+            std::mem::size_of_val(buf),
+            u64::from(libc::FSOPT_ATTR_CMN_EXTENDED | libc::FSOPT_PACK_INVAL_ATTRS),
+        )
     }
 }
 
@@ -486,5 +516,79 @@ mod tests {
         e[offset::RETURNED_FILE..offset::RETURNED_FILE + 4].copy_from_slice(&FILE.to_ne_bytes());
         assert!(e.len() < offset::FILE_END);
         assert!(parse(Path::new("/nonexistent"), &[e]).files.is_empty());
+    }
+
+    /// A directory holding a file and a subdirectory with another file.
+    fn small_tree(tag: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!("dda-bulk-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sub")).unwrap();
+        std::fs::write(tmp.join("a.js"), b"a").unwrap();
+        std::fs::write(tmp.join("sub").join("b.js"), b"b").unwrap();
+        tmp
+    }
+
+    /// What walking `root` with `fetch` reports, one line per visit.
+    fn visits(root: &Path, fetch: &mut Fetch<'_>) -> Vec<String> {
+        let mut seen = Vec::new();
+        let cancel = AtomicBool::new(false);
+        walk(
+            root,
+            &cancel,
+            &mut |v| {
+                seen.push(match v {
+                    Visit::File(_) => "file".to_string(),
+                    Visit::Modified(_) => "modified".to_string(),
+                    Visit::Unsupported(p) => format!("unsupported {}", p.display()),
+                })
+            },
+            fetch,
+        );
+        seen
+    }
+
+    #[test]
+    fn real_reads_report_every_file() {
+        let tmp = small_tree("real");
+        let seen = visits(&tmp, &mut read_entries);
+        assert_eq!(seen.iter().filter(|v| *v == "file").count(), 2, "{seen:?}");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_volume_without_bulk_reads_hands_the_directory_back() {
+        let tmp = small_tree("unsupported");
+        let seen = visits(&tmp, &mut |_, _| -1);
+        assert_eq!(seen, [format!("unsupported {}", tmp.display())]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_later_failed_read_hands_the_whole_directory_back() {
+        // Entries of the first batch must not be reported as well, or the
+        // fallback would count them twice; nor may the rest go missing.
+        let tmp = small_tree("later");
+        let mut calls = 0;
+        let seen = visits(&tmp, &mut |handle, buf| {
+            calls += 1;
+            if calls == 1 {
+                read_entries(handle, buf)
+            } else {
+                -1
+            }
+        });
+        assert_eq!(seen, [format!("unsupported {}", tmp.display())]);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn a_malformed_batch_hands_the_directory_back() {
+        let tmp = small_tree("malformed");
+        let seen = visits(&tmp, &mut |_, buf| {
+            buf.fill(0);
+            1
+        });
+        assert_eq!(seen, [format!("unsupported {}", tmp.display())]);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

@@ -647,17 +647,29 @@ fn walk_into(tally: &mut Tally, dir: &Path, follow_symlinks: bool, cancel: &Atom
 /// falling back to walkdir for any directory whose volume doesn't support it.
 #[cfg(target_os = "macos")]
 fn bulk_into(tally: &mut Tally, dir: &Path, cancel: &AtomicBool) {
+    bulk_into_with(tally, dir, cancel, &mut crate::bulk::read_entries);
+}
+
+/// [`bulk_into`], reading directories with `fetch`.
+#[cfg(target_os = "macos")]
+fn bulk_into_with(
+    tally: &mut Tally,
+    dir: &Path,
+    cancel: &AtomicBool,
+    fetch: &mut crate::bulk::Fetch<'_>,
+) {
     use crate::bulk::{walk, Visit};
 
     // Like walkdir, count the root's own mtime (without following it).
     if let Ok(modified) = std::fs::symlink_metadata(dir).and_then(|m| m.modified()) {
         tally.modified(modified);
     }
-    walk(dir, cancel, &mut |visit| match visit {
+    let visit = &mut |visit: Visit<'_>| match visit {
         Visit::File(info) => tally.file(info, false),
         Visit::Modified(modified) => tally.modified(modified),
         Visit::Unsupported(path) => walk_into(tally, path, false, cancel),
-    });
+    };
+    walk(dir, cancel, visit, fetch);
 }
 
 #[cfg(test)]
@@ -1150,6 +1162,21 @@ mod tests {
 
         let _ = fs::remove_dir_all(&tmp);
         let _ = fs::remove_file(&outside);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn volumes_without_bulk_reads_are_walked_instead() {
+        let tmp = make_tree("bulk-fallback");
+        let cancel = AtomicBool::new(false);
+        let mut walked = Tally::new(false);
+        walk_into(&mut walked, &tmp, false, &cancel);
+        let mut fallback = Tally::new(false);
+        bulk_into_with(&mut fallback, &tmp, &cancel, &mut |_, _| -1);
+        let (walked, fallback) = (walked.finish(), fallback.finish());
+        assert_eq!(walked.1, 2);
+        assert_eq!(fallback, walked);
+        let _ = fs::remove_dir_all(&tmp);
     }
 
     #[test]
