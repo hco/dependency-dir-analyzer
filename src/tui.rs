@@ -1076,9 +1076,9 @@ impl App {
         };
         let removed = p.done - p.failures - p.pruned;
         let mut done = Vec::new();
-        if removed > 0 || p.pruned == 0 {
+        if removed > 0 {
             done.push(format!(
-                "Deleted {removed} director{}",
+                "deleted {removed} director{}",
                 if removed == 1 { "y" } else { "ies" }
             ));
         }
@@ -1089,11 +1089,17 @@ impl App {
                 if p.pruned == 1 { "" } else { "s" }
             ));
         }
-        let mut msg = format!(
-            "{} · reclaimed {}",
-            done.join(", "),
-            self.fmt_size(p.reclaimed)
-        );
+        let mut msg = if done.is_empty() {
+            "Nothing removed".to_string()
+        } else {
+            let done = done.join(", ");
+            format!(
+                "{}{} · reclaimed {}",
+                done[..1].to_uppercase(),
+                &done[1..],
+                self.fmt_size(p.reclaimed)
+            )
+        };
         if p.failures > 0 {
             // The last failure's text, so e.g. the prune command to run by
             // hand is right there instead of only counted.
@@ -3120,6 +3126,65 @@ mod tests {
             action.contains("pnpm store prune --store-dir /s/store"),
             "{action}"
         );
+    }
+
+    /// The message after deleting `removed` directories (100 MB freeable
+    /// each), pruning a store (500 → 320 MB on disk) and a failed prune.
+    fn deletion_message(removed: usize, pruned: bool, failed: bool) -> String {
+        const MB: u64 = 1_000_000;
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total: removed + usize::from(pruned) + usize::from(failed),
+            reclaimed: 0,
+            failures: 0,
+            pruned: 0,
+        });
+        for i in 0..removed {
+            let path = PathBuf::from(format!("/tmp/p{i}"));
+            app.apply_delete_outcome(DeleteOutcome::Removed {
+                path,
+                size: MB * 100,
+            });
+        }
+        let store = PathBuf::from("/s/store/v10");
+        if pruned {
+            app.apply_delete_outcome(DeleteOutcome::Pruned {
+                old: store_dir_row(store.clone(), MB * 500, MB * 200),
+                new: store_dir_row(store.clone(), MB * 320, MB * 20),
+            });
+        }
+        if failed {
+            app.apply_delete_outcome(DeleteOutcome::Failed {
+                path: store,
+                verb: "prune",
+                error: "no pnpm".to_string(),
+            });
+        }
+        app.finish_deletion();
+        let (a, b) = (app.fmt_size(MB * 180), app.fmt_size(MB * 380));
+        let msg = app.action.unwrap();
+        msg.replace(&a, "<180>").replace(&b, "<380>")
+    }
+
+    #[test]
+    fn deletion_messages_name_what_happened() {
+        assert_eq!(
+            deletion_message(0, true, false),
+            "Pruned 1 store · reclaimed <180>"
+        );
+        assert_eq!(
+            deletion_message(2, true, false),
+            "Deleted 2 directories, pruned 1 store · reclaimed <380>"
+        );
+        assert!(deletion_message(1, false, false).starts_with("Deleted 1 directory · "));
+        assert!(
+            deletion_message(0, false, true).starts_with("Nothing removed · 1 failed: "),
+            "{}",
+            deletion_message(0, false, true)
+        );
+        assert!(deletion_message(0, true, true)
+            .starts_with("Pruned 1 store · reclaimed <180> · 1 failed: "));
     }
 
     #[test]
