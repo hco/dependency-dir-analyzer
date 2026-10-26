@@ -627,8 +627,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
         std::fs::create_dir_all(&tmp).unwrap();
         assert_eq!(store_dir_for(&tmp), None);
-        std::fs::write(tmp.join(".modules.yaml"), "storeDir: /s/v10\n").unwrap();
-        assert_eq!(store_dir_for(&tmp), Some(PathBuf::from("/s/v10")));
+        // A real absolute path, so it also carries a drive on Windows.
+        let store = tmp.join("store").join("v10");
+        let yaml = format!("storeDir: {}\n", store.display());
+        std::fs::write(tmp.join(".modules.yaml"), yaml).unwrap();
+        assert_eq!(store_dir_for(&tmp), Some(store));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
