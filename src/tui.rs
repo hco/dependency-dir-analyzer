@@ -3242,6 +3242,24 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    #[test]
+    fn deleting_a_store_rechecks_it_strictly() {
+        // `files/` and `projects/` without content buckets: API routes look
+        // like this, and the re-check before removal must refuse them too.
+        let tmp = std::env::temp_dir().join(format!("dda-store-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let route = tmp.join("api").join("v10");
+        std::fs::create_dir_all(route.join("files").join("[id]")).unwrap();
+        std::fs::create_dir_all(route.join("projects")).unwrap();
+        std::fs::write(route.join("files").join("route.ts"), b"x").unwrap();
+
+        let outcome = delete_target(store_dir_row(route.clone(), 1, 1), StoreAction::Delete);
+
+        assert!(matches!(outcome, DeleteOutcome::Failed { .. }));
+        assert!(route.join("files").join("route.ts").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
     #[cfg(unix)]
     #[test]
     fn deleting_a_linked_store_checks_and_removes_the_same_dir() {
