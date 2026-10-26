@@ -82,9 +82,10 @@ pub fn run(
         scanner::scan_streaming(&root_buf, &opts, tx, scan_cancel);
     });
 
-    // Restore the view preferences last used for this directory. A `--icons`
-    // flag overrides the remembered icon style just for this run.
-    let mut view = state::load(root);
+    // Restore the view preferences last used for this directory. `--icons`
+    // and `--size-mode` override them just for this run.
+    let remembered = state::load(root);
+    let mut view = remembered.clone();
     if let Some(style) = icons {
         view.icon_style = style;
     }
@@ -124,7 +125,10 @@ pub fn run(
 
     // Remember the current view for next time (best-effort; only on clean exit).
     if result.is_ok() {
-        state::save(root, &app.view_state());
+        state::save(
+            root,
+            &view_to_save(&remembered, app.view_state(), icons, size_mode),
+        );
         // The store action is a machine-wide choice, saved with the settings.
         let mut settings = state::settings();
         if settings.store_action != app.store_action {
@@ -2269,6 +2273,23 @@ impl App {
     }
 }
 
+/// The view to remember for next time: what the TUI ended on, except that a
+/// setting still at the value a run flag forced keeps its remembered value.
+fn view_to_save(
+    remembered: &ViewState,
+    mut current: ViewState,
+    icons: Option<IconStyle>,
+    size_mode: Option<SizeMode>,
+) -> ViewState {
+    if icons == Some(current.icon_style) {
+        current.icon_style = remembered.icon_style;
+    }
+    if size_mode == Some(current.size_mode) {
+        current.size_mode = remembered.size_mode;
+    }
+    current
+}
+
 /// Delete (or, for a pnpm store in prune mode, prune) one marked directory,
 /// for the deletion worker.
 fn delete_target(dir: DependencyDir, store_action: StoreAction, follow: bool) -> DeleteOutcome {
@@ -2984,6 +3005,39 @@ mod tests {
         let out = screen(&mut app, 200, 24);
         assert!(out.contains("Deleted 1 directory"), "{out}");
         assert!(out.contains("mostly shared"), "{out}");
+    }
+
+    #[test]
+    fn run_flags_are_not_saved_as_the_remembered_view() {
+        let remembered = ViewState {
+            icon_style: IconStyle::Emoji,
+            size_mode: SizeMode::Freeable,
+            ..ViewState::default()
+        };
+        // Started with `--icons nerd --size-mode allocated`, nothing toggled.
+        let current = ViewState {
+            icon_style: IconStyle::Nerd,
+            size_mode: SizeMode::Allocated,
+            ..ViewState::default()
+        };
+        let flags = (Some(IconStyle::Nerd), Some(SizeMode::Allocated));
+        let saved = view_to_save(&remembered, current.clone(), flags.0, flags.1);
+        assert_eq!(saved.icon_style, IconStyle::Emoji);
+        assert_eq!(saved.size_mode, SizeMode::Freeable);
+
+        // Changed in the TUI after starting with the flags: that is a choice.
+        let changed = ViewState {
+            icon_style: IconStyle::Off,
+            ..current.clone()
+        };
+        let saved = view_to_save(&remembered, changed, flags.0, flags.1);
+        assert_eq!(saved.icon_style, IconStyle::Off);
+        assert_eq!(saved.size_mode, SizeMode::Freeable);
+
+        // Without flags everything shown is what gets remembered.
+        let saved = view_to_save(&remembered, current, None, None);
+        assert_eq!(saved.icon_style, IconStyle::Nerd);
+        assert_eq!(saved.size_mode, SizeMode::Allocated);
     }
 
     #[test]
