@@ -185,12 +185,12 @@ pub fn prune(store: &Path) -> Result<(), String> {
             layout.to_string_lossy()
         ));
     };
-    let manual = shell_line(&program, &args);
+    let manual = manual_hint(&program, &args, shell_line);
     if !store.is_dir() {
-        return Err(format!("store not found; run manually: {manual}"));
+        return Err(format!("store not found; {manual}"));
     }
-    let output = run(&program, &args)
-        .map_err(|e| format!("could not start {program}: {e}; run manually: {manual}"))?;
+    let output =
+        run(&program, &args).map_err(|e| format!("could not start {program}: {e}; {manual}"))?;
     if output.status.success() {
         return Ok(());
     }
@@ -201,7 +201,7 @@ pub fn prune(store: &Path) -> Result<(), String> {
         .find(|l| !l.trim().is_empty())
         .map(str::trim)
         .unwrap_or("pnpm store prune failed");
-    Err(format!("{reason}; run manually: {manual}"))
+    Err(format!("{reason}; {manual}"))
 }
 
 /// Major version of the pnpm on `PATH`, if there is one.
@@ -266,13 +266,37 @@ fn launch_names(program: &str) -> Vec<String> {
     names
 }
 
+/// How to run `program args…` by hand, as a line built by `line`. If the
+/// store path can't be put into one safely (it comes from the scanned tree,
+/// and pasting it must not run anything), a `<store>` placeholder stands in.
+fn manual_hint(
+    program: &str,
+    args: &[String],
+    line: impl Fn(&str, &[String]) -> Option<String>,
+) -> String {
+    if let Some(line) = line(program, args) {
+        return format!("run manually: {line}");
+    }
+    let mut args = args.to_vec();
+    if let Some(at) = args.iter().position(|a| a == "--store-dir") {
+        args.truncate(at + 1);
+        args.push("<store>".to_string());
+    }
+    match line(program, &args) {
+        Some(line) => format!(
+            "run manually: {line} (put in the store's path; a shell would expand parts of it)"
+        ),
+        None => format!("run `{program} store prune` by hand"),
+    }
+}
+
 /// A command line to copy into the platform's shell, quoting arguments that
-/// need it.
-fn shell_line(program: &str, args: &[String]) -> String {
+/// need it, or `None` if quoting can't keep an argument from being expanded.
+fn shell_line(program: &str, args: &[String]) -> Option<String> {
     if cfg!(windows) {
         windows_line(program, args)
     } else {
-        posix_line(program, args)
+        Some(posix_line(program, args))
     }
 }
 
@@ -285,12 +309,28 @@ fn posix_line(program: &str, args: &[String]) -> String {
     })
 }
 
-/// `program args…` for cmd.exe or PowerShell: both read "…" as one word,
-/// and `""` inside it as a quote. cmd also splits words at `,`, `;` and `=`.
-fn windows_line(program: &str, args: &[String]) -> String {
-    quoted_line(program, args, "@+:./_-\\", |arg| {
-        format!("\"{}\"", arg.replace('"', "\"\""))
-    })
+/// `program args…` for cmd.exe or PowerShell: both read "…" as one word.
+/// cmd also splits words at `,`, `;` and `=`. `None` if an argument holds
+/// what either expands even inside "…".
+fn windows_line(program: &str, args: &[String]) -> Option<String> {
+    if args
+        .iter()
+        .any(|a| a.chars().any(expands_in_windows_quotes))
+    {
+        return None;
+    }
+    Some(quoted_line(program, args, "@+:./_-\\", |arg| {
+        format!("\"{arg}\"")
+    }))
+}
+
+/// cmd expands `%VAR%` and `!VAR!` inside "…", PowerShell `$` and `` ` ``,
+/// and PowerShell also ends a string at typographic double quotes.
+fn expands_in_windows_quotes(c: char) -> bool {
+    matches!(
+        c,
+        '"' | '%' | '!' | '$' | '`' | '\u{201C}' | '\u{201D}' | '\u{201E}'
+    ) || c.is_control()
 }
 
 /// `program` followed by `args`, each quoted with `quote` unless it is
@@ -584,14 +624,48 @@ mod tests {
                 "x=y",
                 "x;y",
                 "a&b",
-                "say \"hi\"",
+                "(x)",
                 "",
                 "pnpm@10",
             ]),
         );
         assert_eq!(
-            line,
-            r#"pnpm.cmd store --store-dir "C:\Users\Jo Doe\AppData\Local\pnpm\store\v10" C:\plain\v10 "a,b" "x=y" "x;y" "a&b" "say ""hi""" "" pnpm@10"#
+            line.as_deref(),
+            Some(
+                r#"pnpm.cmd store --store-dir "C:\Users\Jo Doe\AppData\Local\pnpm\store\v10" C:\plain\v10 "a,b" "x=y" "x;y" "a&b" "(x)" "" pnpm@10"#
+            )
+        );
+    }
+
+    #[test]
+    fn windows_lines_are_withheld_when_quotes_cannot_protect_them() {
+        // Inside "…" cmd still expands %VAR% and !VAR!, PowerShell $(…),
+        // $var and `-escapes, and PowerShell also ends a string at “ ” „.
+        for path in [
+            r"C:\%PATH%\v10",
+            r"C:\!x!\v10",
+            r"C:\$(calc)\v10",
+            r"C:\a`b\v10",
+            "C:\\a\"b\\v10",
+            "C:\\a\u{201d}; calc; \u{201c}\\v10",
+            "C:\\a\nb\\v10",
+        ] {
+            let line = windows_line("pnpm", &args(&["store", "prune", "--store-dir", path]));
+            assert_eq!(line, None, "{path}");
+        }
+    }
+
+    #[test]
+    fn manual_hint_leaves_out_paths_a_shell_would_expand() {
+        let plain = args(&["store", "prune", "--store-dir", r"C:\s\v10"]);
+        assert_eq!(
+            manual_hint("pnpm", &plain, windows_line),
+            r"run manually: pnpm store prune --store-dir C:\s\v10"
+        );
+        let hostile = args(&["store", "prune", "--store-dir", r"C:\$(calc)\v10"]);
+        assert_eq!(
+            manual_hint("pnpm", &hostile, windows_line),
+            r#"run manually: pnpm store prune --store-dir "<store>" (put in the store's path; a shell would expand parts of it)"#
         );
     }
 
@@ -601,7 +675,7 @@ mod tests {
         let expected = if cfg!(windows) {
             windows_line("pnpm", &args)
         } else {
-            posix_line("pnpm", &args)
+            Some(posix_line("pnpm", &args))
         };
         assert_eq!(shell_line("pnpm", &args), expected);
     }
