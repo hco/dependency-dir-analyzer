@@ -25,6 +25,14 @@ brew install hco/tap/dda
 - **Reclaim space safely** — mark the directories you want gone (one at a time,
   a whole ecosystem, or everything visible), watch the total to-be-freed size
   add up, then delete them after a confirmation step.
+- **What deleting actually frees** — sizes count disk blocks, not file
+  lengths, and leave out what is shared with other projects via hardlinks or
+  APFS clones (as pnpm does), so a `node_modules` that is mostly a view of the
+  pnpm store doesn't promise space it can't give back. Toggle to the on-disk
+  size any time. See [How sizes are measured](#how-sizes-are-measured).
+- **pnpm stores** — the stores your projects install from are listed too, and
+  deleting one prunes it (`pnpm store prune`) unless you ask for the whole
+  store to go (never for a pnpm 11 store, which projects link into).
 - **Size _and_ last-modified time** — stale directories (good cleanup
   candidates) are colour-coded by age, so you can tell a six-month-old
   `node_modules` from one you built this morning.
@@ -49,7 +57,7 @@ $ dda ~/code | cat
 180 MB    1y ago   Python (venv)    /home/me/code/ml/.venv
  36 MB    3w ago   Go / PHP / Ruby  /home/me/code/api/vendor
 
-1.84 GB across 4 directories (52831 files)
+1.84 GB freeable across 4 directories (1.91 GB on disk, 52831 files)
 ```
 
 ## Usage
@@ -62,21 +70,28 @@ Arguments:
   [PATH]  Root directory to scan [default: .]
 
 Options:
-  -f, --format <FORMAT>    Output format [default: table] [possible values: table, json, csv]
-  -m, --min-size <SIZE>    Only report directories at least this large (e.g. 10MB, 1.5GB, 500K)
-  -t, --top <TOP>          Show at most this many results (largest first); 0 = no limit [default: 0]
-      --follow-symlinks    Follow symbolic links while scanning
-      --plain              Print a plain static table instead of the interactive TUI
-      --no-summary         Do not print the summary footer (non-interactive output)
-      --no-mouse           Disable mouse capture in the interactive UI
-  -h, --help               Print help
-  -V, --version            Print version
+  -f, --format <FORMAT>        Output format [default: table] [possible values: table, json, csv]
+  -m, --min-size <SIZE>        Only report directories at least this large (e.g. 10MB, 1.5GB, 500K)
+  -t, --top <TOP>              Show at most this many results (largest first); 0 = no limit [default: 0]
+      --follow-symlinks        Follow symbolic links while scanning
+      --icons <STYLE>          Ecosystem icon style in the interactive UI [possible values: off, emoji, nerd]
+      --size-mode <MODE>       Size to show and sort by [possible values: freeable, allocated]
+      --no-pnpm-default-store  Only list pnpm stores that a scanned project uses
+      --plain                  Print a plain static table instead of the interactive TUI
+      --no-mouse               Disable mouse capture in the interactive UI
+      --no-summary             Do not print the summary footer (non-interactive output)
+  -h, --help                   Print help
+  -V, --version                Print version
 ```
 
 The interactive TUI is used automatically when the default `table` format
 writes to a terminal. It falls back to the plain table when the output is piped
 or redirected, or when you pass `--plain`. `--format json` and `--format csv`
 are always non-interactive.
+
+`--size-mode` picks which size the table shows, sorts by and applies
+`--min-size` to: `freeable` (the default) or `allocated` (on disk). In the TUI
+it overrides the remembered choice for that run.
 
 ### TUI keys
 
@@ -85,10 +100,13 @@ are always non-interactive.
 | `↑` / `↓`, `j` / `k` | Move the cursor                             |
 | `PgUp` / `PgDn`      | Jump a page                                 |
 | `Home` / `End`       | Jump to the first / last row                |
-| `s`                  | Cycle sort (size → modified → name → files) |
+| `S`                  | Cycle sort (size → modified → name → files) |
+| `f`                  | Toggle the size shown (freeable ↔ on disk)  |
+| `u`                  | Toggle size units (MB ↔ auto)               |
+| `i`                  | Cycle ecosystem icons (emoji → nerd → off)  |
 | `g`                  | Toggle grouping by ecosystem                |
 | `Enter`              | Fold / unfold the selected group            |
-| `f`                  | Cycle the minimum-size filter               |
+| `s`                  | Cycle the minimum-size filter               |
 | `a`                  | Cycle the "modified older than" filter      |
 | `e`                  | Open the ecosystem filter (multi-select)    |
 | `r`                  | Reset all filters and grouping              |
@@ -96,6 +114,7 @@ are always non-interactive.
 | `A`                  | Mark / unmark all visible directories       |
 | `c`                  | Clear the selection                         |
 | `d` / `Del`          | Delete marked directories (asks to confirm) |
+| `p`                  | pnpm stores: prune (default) ↔ delete whole (not pnpm 11) |
 | `?`                  | Toggle the keyboard-shortcuts help          |
 | `q` / `Esc`          | Quit                                        |
 
@@ -103,13 +122,27 @@ When you press `d`, a confirmation dialog lists what will be removed and the
 space it frees; press `y` to confirm or `Esc` to cancel. Deletion is
 **permanent** — directories are removed right away, not moved to the system
 trash. They are dependency directories, so your package manager or build tool
-can regenerate them.
+can regenerate them. The space shown is always the freeable size, whichever
+size the table displays.
+
+A marked **pnpm store** is pruned by default (`pnpm store prune`): only
+packages no project references anymore are removed, so nothing has to be
+downloaded again. Marked projects are deleted first, so the prune also drops
+what only they were using. Press `p` (or click the `store:` chip) to delete the
+whole store instead; the confirmation dialog names the action per store, and
+the choice is remembered. Every project that used a deleted store installs
+its packages again on its next `pnpm install`. A store with a `links/`
+directory (pnpm 11) is only ever pruned: projects' `node_modules` are
+symlinks into it, so deleting it would break them until they reinstall. dda
+runs the installed `pnpm` when it reads that store's layout (`v10` → pnpm 10,
+`v3` → pnpm 7–9) and `npx pnpm@<major>` otherwise; layouts no pnpm writes
+are not pruned. If that fails, the footer shows the command to run yourself.
 
 ### Mouse
 
 The TUI also responds to the mouse: the **scroll wheel** moves the selection, a
 **left click** highlights the row under the cursor, and the header filter chips,
-footer status chips (sort / group / unit / icons) and overlay controls are all
+footer status chips (show / sort / group / unit / icons / store) and overlay controls are all
 **clickable** — each bound to the same action as its key.
 
 Capturing the mouse suppresses the terminal's own click-drag text selection and
@@ -155,6 +188,66 @@ dda completions fish > ~/.config/fish/completions/dda.fish
 
 When a directory matches, its whole subtree is sized as one unit and the scanner
 does not descend further, so nested matches are never double-counted.
+
+## How sizes are measured
+
+dda reports two sizes per directory:
+
+- **On disk** (`allocated_bytes`) — the blocks the files occupy, like `du`. A
+  file hardlinked several times inside the directory counts once.
+- **Freeable** (`freeable_bytes`) — what deleting the directory would actually
+  give back. A file that is also reachable from outside the directory, through
+  a hardlink (pnpm on Linux) or as an APFS clone (pnpm on macOS) whose other
+  copies live elsewhere, stays on disk after the delete and is not counted.
+  Clones are tracked per file with APFS's clone id and reference count (macOS
+  only; other volumes treat every file as its own). On Windows dda can't tell
+  hardlinks apart, so every file counts as the directory's own and freeable
+  equals on disk; pnpm's hardlinked `node_modules` look fully freeable there.
+
+On macOS, dda reads each directory's file sizes, link counts and clone ids
+in bulk with `getattrlistbulk`, so this costs no more time than summing plain
+file lengths. Volumes that don't support it, and `--follow-symlinks`, fall
+back to one call per file.
+
+The TUI and plain table show **freeable** by default; `f` or `--size-mode
+allocated` switches to on disk. Rows marked `⇄` are mostly shared: deleting
+them frees less than half of what they occupy. Summed totals are a guide, not
+an exact figure: two projects sharing the same packages each count those as
+not freeable, even though deleting both would free them.
+
+### pnpm stores
+
+pnpm keeps one store of packages per machine and clones or hardlinks them into
+every project's `node_modules` (pnpm 11 symlinks them from the store's
+`links/` instead). dda reads each `node_modules/.modules.yaml` to
+find the stores in use and lists each one once (including pnpm's default
+location, unless `--no-pnpm-default-store` or the `pnpm_default_store`
+setting turns that off). For pnpm 10 and older, a store's freeable size is
+roughly what `pnpm store prune` can reclaim: packages no project points at
+anymore. pnpm 11 projects symlink to packages in the store's `links/`, and
+dda doesn't follow those links back, so for such a store the freeable size
+is only an upper bound; the TUI marks it `≤` and the confirmation dialog says
+"Reclaims up to".
+
+### Time Machine snapshots
+
+On macOS, local Time Machine snapshots keep a copy of everything on the volume
+as it was when the snapshot was taken. Deleted files stay on disk until every
+snapshot that includes them has expired (usually within 24 hours), so free space
+may not grow right away. Snapshots cover the whole volume; no folder can be
+excluded from them (`tmutil addexclusion` only affects backups). dda ignores
+snapshots when measuring and shows a reminder in the footer when any exist.
+
+### JSON and CSV fields
+
+Every directory has `path`, `ecosystem`, `name`, `kind` (`dependency` or
+`pnpm_store`), `allocated_bytes`, `freeable_bytes`, `file_count` and its
+modification time (`modified` in JSON as `{unix, rfc3339}`;
+`modified_unix` / `modified_rfc3339` in CSV). JSON also carries
+`total_allocated_bytes`, `total_freeable_bytes`, `total_file_count` and
+`directory_count`. Both formats always contain both sizes, whatever
+`--size-mode` is set to; the mode only decides the sort order and what
+`--min-size` applies to.
 
 ## Install
 

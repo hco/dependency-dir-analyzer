@@ -70,6 +70,41 @@ impl SizeUnit {
     }
 }
 
+/// Which byte count the size column shows. Toggled with `f` in the TUI and
+/// settable up front with `--size-mode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
+pub enum SizeMode {
+    /// What deleting the directory would actually give back: bytes not shared
+    /// (via hardlinks or APFS clones) with anything outside it.
+    #[default]
+    Freeable,
+    /// Allocated on disk, like `du`: hardlinked inodes count once.
+    Allocated,
+}
+
+impl SizeMode {
+    pub fn toggle(self) -> Self {
+        match self {
+            SizeMode::Freeable => SizeMode::Allocated,
+            SizeMode::Allocated => SizeMode::Freeable,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SizeMode::Freeable => "freeable",
+            SizeMode::Allocated => "on disk",
+        }
+    }
+
+    pub fn column_title(self) -> &'static str {
+        match self {
+            SizeMode::Freeable => "Freeable",
+            SizeMode::Allocated => "On disk",
+        }
+    }
+}
+
 /// How (and whether) an icon is shown next to each ecosystem. Cycled with `i`
 /// in the TUI and settable up front with `--icons`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, clap::ValueEnum)]
@@ -151,17 +186,17 @@ fn nerd_icon(ecosystem: &str) -> &'static str {
         return "\u{e606}"; // nf-seti-python
     }
     match ecosystem {
-        "Node.js" | "Next.js" | "Nuxt" | "SvelteKit" | "Bower" => "\u{e718}", // nf-dev-nodejs_small
-        "Angular" => "\u{e753}",                                              // nf-dev-angular
-        "Rust / Maven" | "Cargo (cache)" => "\u{e7a8}",                       // nf-dev-rust
-        "Go / PHP / Ruby" => "\u{e724}",                                      // nf-dev-go
-        "Ruby (Bundler)" => "\u{e739}",                                       // nf-dev-ruby
-        "Gradle" => "\u{e660}",                                               // nf-seti-gradle
-        "Dart / Flutter" => "\u{e798}",                                       // nf-dev-dart
-        "Elm" => "\u{e62c}",                                                  // nf-seti-elm
-        "CocoaPods" | "Xcode" => "\u{e711}",                                  // nf-dev-apple
-        "Terraform" => "\u{e69a}",                                            // nf-seti-terraform
-        _ => "\u{f487}",                                                      // nf-oct-package
+        "Node.js" | "Next.js" | "Nuxt" | "SvelteKit" | "Bower" | "pnpm store" => "\u{e718}", // nf-dev-nodejs_small
+        "Angular" => "\u{e753}",                        // nf-dev-angular
+        "Rust / Maven" | "Cargo (cache)" => "\u{e7a8}", // nf-dev-rust
+        "Go / PHP / Ruby" => "\u{e724}",                // nf-dev-go
+        "Ruby (Bundler)" => "\u{e739}",                 // nf-dev-ruby
+        "Gradle" => "\u{e660}",                         // nf-seti-gradle
+        "Dart / Flutter" => "\u{e798}",                 // nf-dev-dart
+        "Elm" => "\u{e62c}",                            // nf-seti-elm
+        "CocoaPods" | "Xcode" => "\u{e711}",            // nf-dev-apple
+        "Terraform" => "\u{e69a}",                      // nf-seti-terraform
+        _ => "\u{f487}",                                // nf-oct-package
     }
 }
 
@@ -257,6 +292,36 @@ impl AgeFilter {
     }
 }
 
+/// What deleting a marked pnpm store does. Toggled with `p` in the TUI and
+/// remembered globally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum StoreAction {
+    /// `pnpm store prune`: drop only packages no project references, so
+    /// nothing has to be downloaded again.
+    #[default]
+    Prune,
+    /// Remove the whole store; every project re-downloads on next install.
+    /// Never applied to a store projects link into (pnpm 11's `links/`),
+    /// which is pruned instead.
+    Delete,
+}
+
+impl StoreAction {
+    pub fn toggle(self) -> Self {
+        match self {
+            StoreAction::Prune => StoreAction::Delete,
+            StoreAction::Delete => StoreAction::Prune,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            StoreAction::Prune => "prune",
+            StoreAction::Delete => "delete",
+        }
+    }
+}
+
 /// Global preferences that apply to every scan, independent of the scan root.
 ///
 /// Kept separate from the per-root [`ViewState`] because they are machine-wide
@@ -277,6 +342,12 @@ pub struct Settings {
     /// install, which never knew the trash mode, is handled in [`parse_store`]
     /// instead, which marks it acknowledged when there is no store at all.
     pub trash_removal_acknowledged: bool,
+    /// Whether pnpm's default store location is listed even when no project
+    /// in the scan points at it. The `--no-pnpm-default-store` flag turns it
+    /// off for one run.
+    pub pnpm_default_store: bool,
+    /// What deleting a marked pnpm store does.
+    pub store_action: StoreAction,
 }
 
 impl Default for Settings {
@@ -285,6 +356,8 @@ impl Default for Settings {
         Settings {
             mouse: true,
             trash_removal_acknowledged: false,
+            pnpm_default_store: true,
+            store_action: StoreAction::Prune,
         }
     }
 }
@@ -317,6 +390,7 @@ pub struct ViewState {
     pub collapsed_ecos: HashSet<String>,
     pub size_unit: SizeUnit,
     pub icon_style: IconStyle,
+    pub size_mode: SizeMode,
 }
 
 /// Load the saved view state for `root`, or defaults if none is stored.
@@ -543,6 +617,42 @@ mod tests {
         // Once acknowledged, it stays that way.
         let acked = br#"{"settings":{"trash_removal_acknowledged":true}}"#;
         assert!(parse_store(Some(acked)).settings.trash_removal_acknowledged);
+    }
+
+    #[test]
+    fn store_action_toggles_and_defaults_to_prune() {
+        assert_eq!(Settings::default().store_action, StoreAction::Prune);
+        assert_eq!(StoreAction::Prune.toggle(), StoreAction::Delete);
+        assert_eq!(StoreAction::Delete.toggle(), StoreAction::Prune);
+        assert_eq!(StoreAction::Prune.label(), "prune");
+        assert_eq!(StoreAction::Delete.label(), "delete");
+        let back: Settings = serde_json::from_str(r#"{"store_action": "Delete"}"#).unwrap();
+        assert_eq!(back.store_action, StoreAction::Delete);
+    }
+
+    #[test]
+    fn settings_default_to_pnpm_default_store_on() {
+        assert!(Settings::default().pnpm_default_store);
+        // A store written before the field existed keeps it on.
+        let old: Settings = serde_json::from_str(r#"{"mouse": false}"#).unwrap();
+        assert!(old.pnpm_default_store);
+    }
+
+    #[test]
+    fn size_mode_toggles_and_round_trips() {
+        assert_eq!(SizeMode::default(), SizeMode::Freeable);
+        assert_eq!(SizeMode::Freeable.toggle(), SizeMode::Allocated);
+        assert_eq!(SizeMode::Freeable.toggle().toggle(), SizeMode::Freeable);
+
+        let state = ViewState {
+            size_mode: SizeMode::Allocated,
+            ..Default::default()
+        };
+        let back: ViewState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(back.size_mode, SizeMode::Allocated);
+        // Stores written before the field existed default to freeable.
+        let old: ViewState = serde_json::from_str("{}").unwrap();
+        assert_eq!(old.size_mode, SizeMode::Freeable);
     }
 
     #[test]

@@ -2,7 +2,7 @@
 name = "dependency-dir-analyzer"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.74"
+rust-version = "1.77.2"
 description = "Scan a directory tree for dependency directories (node_modules, target, .venv, …) and report how much space they use."
 authors = ["Hans-Christian Otto"]
 license = "MIT"
@@ -31,6 +31,11 @@ serde_json = "1.0"
 time = { version = "0.3", features = ["formatting"] }
 walkdir = "2.5"
 
+# `getattrlist` for APFS clone detection (see `usage.rs`). Hardlinks and block
+# counts come from std's `MetadataExt`, so no other platform needs it.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2.191"
+
 [profile.release]
 opt-level = 3
 lto = true
@@ -43,3 +48,4 @@ strip = true
 # binaries dist ships are identical to a local release build. dist defaults
 # this to thin LTO for build speed, which this small crate doesn't need.
 inherits = "release"
+

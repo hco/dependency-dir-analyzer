@@ -34,9 +34,13 @@ use ratatui::widgets::{
 };
 use ratatui::DefaultTerminal;
 
+use crate::pnpm;
 use crate::report::{group_thousands, human_size, megabytes_size, relative_age};
+use crate::scanner::DirKind;
 use crate::scanner::{self, DependencyDir, ScanEvent, ScanOptions};
-use crate::state::{self, AgeFilter, IconStyle, SizeFilter, SizeUnit, SortKey, ViewState};
+use crate::state::{
+    self, AgeFilter, IconStyle, SizeFilter, SizeMode, SizeUnit, SortKey, StoreAction, ViewState,
+};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Redraw cadence while something is animating (the scan or a deletion is
@@ -65,6 +69,7 @@ pub fn run(
     top: usize,
     min_size: u64,
     icons: Option<IconStyle>,
+    size_mode: Option<SizeMode>,
     mouse: bool,
 ) -> Result<Vec<DependencyDir>> {
     let (tx, rx) = mpsc::channel();
@@ -77,11 +82,15 @@ pub fn run(
         scanner::scan_streaming(&root_buf, &opts, tx, scan_cancel);
     });
 
-    // Restore the view preferences last used for this directory. A `--icons`
-    // flag overrides the remembered icon style just for this run.
-    let mut view = state::load(root);
+    // Restore the view preferences last used for this directory. `--icons`
+    // and `--size-mode` override them just for this run.
+    let remembered = state::load(root);
+    let mut view = remembered.clone();
     if let Some(style) = icons {
         view.icon_style = style;
+    }
+    if let Some(mode) = size_mode {
+        view.size_mode = mode;
     }
 
     let mut terminal = ratatui::init();
@@ -96,7 +105,10 @@ pub fn run(
     }
     let mut app = App::new(root.to_path_buf(), top, min_size, view);
     app.mouse_enabled = mouse;
-    app.trash_notice_pending = !state::settings().trash_removal_acknowledged;
+    let settings = state::settings();
+    app.trash_notice_pending = !settings.trash_removal_acknowledged;
+    app.store_action = settings.store_action;
+    app.snapshots = crate::usage::has_local_snapshots();
     let result = app.event_loop(&mut terminal, rx);
     if mouse {
         let _ = execute!(std::io::stdout(), DisableMouseCapture);
@@ -112,7 +124,16 @@ pub fn run(
 
     // Remember the current view for next time (best-effort; only on clean exit).
     if result.is_ok() {
-        state::save(root, &app.view_state());
+        state::save(
+            root,
+            &view_to_save(&remembered, app.view_state(), icons, size_mode),
+        );
+        // The store action is a machine-wide choice, saved with the settings.
+        let mut settings = state::settings();
+        if settings.store_action != app.store_action {
+            settings.store_action = app.store_action;
+            state::save_settings(&settings);
+        }
     }
 
     result.map(|()| app.final_results())
@@ -161,8 +182,21 @@ enum Overlay {
 /// The result of trying to remove one directory, sent back from the worker
 /// thread as it goes so the UI can update without blocking.
 enum DeleteOutcome {
-    Removed { path: PathBuf, size: u64 },
-    Failed { path: PathBuf, error: String },
+    Removed {
+        path: PathBuf,
+        size: u64,
+    },
+    /// A pnpm store was pruned in place; `new` is it re-measured afterwards.
+    Pruned {
+        old: DependencyDir,
+        new: DependencyDir,
+    },
+    Failed {
+        path: PathBuf,
+        /// What was attempted (`delete` or `prune`), for the warning.
+        verb: &'static str,
+        error: String,
+    },
 }
 
 /// Live state of an in-flight deletion, driving the progress modal.
@@ -171,6 +205,8 @@ struct DeleteProgress {
     total: usize,
     reclaimed: u64,
     failures: usize,
+    /// How many of `done` were stores pruned rather than removed.
+    pruned: usize,
 }
 
 /// One rendered line of the table: an ecosystem group header (only when
@@ -202,6 +238,8 @@ enum ClickAction {
     ToggleGroup,
     CycleUnit,
     CycleIcons,
+    ToggleSizeMode,
+    ToggleStoreAction,
     // Ecosystem overlay.
     EcoToggle(usize),
     EcoAllNone,
@@ -282,6 +320,9 @@ struct App {
     size_unit: SizeUnit,
     /// Which icon (if any) precedes the ecosystem label.
     icon_style: IconStyle,
+    /// Which byte count the size column shows, sorts and filters by. Deletion
+    /// figures always use the freeable bytes regardless.
+    size_mode: SizeMode,
     /// Ecosystems the user has toggled *off* in the ecosystem panel. Empty means
     /// every ecosystem is shown. Stored by label so it survives across restarts.
     disabled_ecos: HashSet<String>,
@@ -321,6 +362,12 @@ struct App {
     /// Cleared, and persisted, on their first confirmed deletion. Defaults to
     /// `false`; [`run`] sets it.
     trash_notice_pending: bool,
+    /// Whether local Time Machine snapshots exist, which keep deleted data
+    /// on disk until they expire. Defaults to `false`; [`run`] sets it.
+    snapshots: bool,
+    /// What deleting a marked pnpm store does. Remembered globally; [`run`]
+    /// loads it from the settings.
+    store_action: StoreAction,
 }
 
 impl App {
@@ -338,6 +385,7 @@ impl App {
             age_filter: view.age_filter,
             size_unit: view.size_unit,
             icon_style: view.icon_style,
+            size_mode: view.size_mode,
             disabled_ecos: view.disabled_ecos,
             collapsed_ecos: view.collapsed_ecos,
             selected: HashSet::new(),
@@ -353,6 +401,8 @@ impl App {
             table_area: None,
             mouse_enabled: true,
             trash_notice_pending: false,
+            snapshots: false,
+            store_action: StoreAction::default(),
         }
     }
 
@@ -367,6 +417,7 @@ impl App {
             icon_style: self.icon_style,
             disabled_ecos: self.disabled_ecos.clone(),
             collapsed_ecos: self.collapsed_ecos.clone(),
+            size_mode: self.size_mode,
         }
     }
 
@@ -517,6 +568,10 @@ impl App {
             KeyCode::Char('S') => self.sort = self.sort.next(),
             KeyCode::Char('u') => self.size_unit = self.size_unit.toggle(),
             KeyCode::Char('i') => self.icon_style = self.icon_style.cycle(),
+            KeyCode::Char('f') => self.size_mode = self.size_mode.toggle(),
+            KeyCode::Char('p') if self.has_store_rows() => {
+                self.store_action = self.store_action.toggle()
+            }
             KeyCode::Char('g') => self.group = !self.group,
             KeyCode::Char('s') => self.size_filter = self.size_filter.next(),
             KeyCode::Char('a') => self.age_filter = self.age_filter.next(),
@@ -543,6 +598,9 @@ impl App {
     fn handle_confirm_key(&mut self, code: KeyCode) {
         match code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => self.confirm_deletion(),
+            KeyCode::Char('p') if self.store_marked() => {
+                self.store_action = self.store_action.toggle()
+            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Char('q') => {
                 self.overlay = Overlay::None;
             }
@@ -663,10 +721,14 @@ impl App {
                     | ToggleGroup
                     | CycleUnit
                     | CycleIcons
+                    | ToggleSizeMode
+                    | ToggleStoreAction
             ),
             Overlay::Ecosystems { .. } => matches!(action, EcoToggle(_) | EcoAllNone),
             Overlay::TrashRemovedNotice => matches!(action, NoticeContinue | ConfirmCancel),
-            Overlay::ConfirmDelete => matches!(action, ConfirmYes | ConfirmCancel),
+            Overlay::ConfirmDelete => {
+                matches!(action, ConfirmYes | ConfirmCancel | ToggleStoreAction)
+            }
             Overlay::Help => false,
         }
     }
@@ -682,6 +744,8 @@ impl App {
             ClickAction::ToggleGroup => self.group = !self.group,
             ClickAction::CycleUnit => self.size_unit = self.size_unit.toggle(),
             ClickAction::CycleIcons => self.icon_style = self.icon_style.cycle(),
+            ClickAction::ToggleSizeMode => self.size_mode = self.size_mode.toggle(),
+            ClickAction::ToggleStoreAction => self.store_action = self.store_action.toggle(),
             ClickAction::EcoToggle(i) => self.toggle_eco_at(i),
             ClickAction::EcoAllNone => self.toggle_all_ecos(),
             ClickAction::NoticeContinue => self.overlay = Overlay::ConfirmDelete,
@@ -884,7 +948,9 @@ impl App {
         self.rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if self.selected.contains(&d.path) => Some(d.size_bytes),
+                Row::Done(d) if self.selected.contains(&d.path) => {
+                    Some(d.bytes(SizeMode::Freeable))
+                }
                 _ => None,
             })
             .fold((0, 0), |(n, bytes), size| (n + 1, bytes + size))
@@ -898,7 +964,7 @@ impl App {
             .iter()
             .filter_map(|r| match r {
                 Row::Done(d) if self.selected.contains(&d.path) => {
-                    Some((d.path.clone(), d.size_bytes))
+                    Some((d.path.clone(), d.bytes(SizeMode::Freeable)))
                 }
                 _ => None,
             })
@@ -912,29 +978,35 @@ impl App {
     /// inline would freeze the UI — while `drain_deletion` applies the streamed
     /// results each tick.
     fn start_deletion(&mut self) {
-        let targets = self.selected_dirs();
+        let mut targets: Vec<DependencyDir> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Done(d) if self.selected.contains(&d.path) => Some(d.clone()),
+                _ => None,
+            })
+            .collect();
         if targets.is_empty() {
             return;
         }
+        // Projects go first: pruning a store afterwards also drops the
+        // packages only those just-deleted projects were holding on to.
+        targets.sort_by_key(|d| d.kind == DirKind::PnpmStore);
+        let store_action = self.store_action;
         self.action = None;
         self.delete_progress = Some(DeleteProgress {
             done: 0,
             total: targets.len(),
             reclaimed: 0,
             failures: 0,
+            pruned: 0,
         });
 
         let (tx, rx) = mpsc::channel();
         self.delete_rx = Some(rx);
         thread::spawn(move || {
-            for (path, size) in targets {
-                let outcome = match std::fs::remove_dir_all(&path) {
-                    Ok(()) => DeleteOutcome::Removed { path, size },
-                    Err(e) => DeleteOutcome::Failed {
-                        path,
-                        error: e.to_string(),
-                    },
-                };
+            for dir in targets {
+                let outcome = delete_target(dir, store_action);
                 // The UI hung up (quit): stop early, nothing left to report to.
                 if tx.send(outcome).is_err() {
                     break;
@@ -951,28 +1023,45 @@ impl App {
                 return;
             };
             match rx.try_recv() {
-                Ok(DeleteOutcome::Removed { path, size }) => {
-                    self.remove_rows(std::slice::from_ref(&path));
-                    self.selected.remove(&path);
-                    if let Some(p) = &mut self.delete_progress {
-                        p.done += 1;
-                        p.reclaimed += size;
-                    }
-                }
-                Ok(DeleteOutcome::Failed { path, error }) => {
-                    self.warnings += 1;
-                    self.last_warning =
-                        Some(format!("failed to delete {}: {error}", path.display()));
-                    self.selected.remove(&path);
-                    if let Some(p) = &mut self.delete_progress {
-                        p.done += 1;
-                        p.failures += 1;
-                    }
-                }
+                Ok(outcome) => self.apply_delete_outcome(outcome),
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
                     self.finish_deletion();
                     return;
+                }
+            }
+        }
+    }
+
+    /// Apply one outcome streamed back from the deletion worker.
+    fn apply_delete_outcome(&mut self, outcome: DeleteOutcome) {
+        match outcome {
+            DeleteOutcome::Removed { path, size } => {
+                self.remove_rows(std::slice::from_ref(&path));
+                self.selected.remove(&path);
+                if let Some(p) = &mut self.delete_progress {
+                    p.done += 1;
+                    p.reclaimed += size;
+                }
+            }
+            DeleteOutcome::Pruned { old, new } => {
+                self.selected.remove(&old.path);
+                if let Some(p) = &mut self.delete_progress {
+                    p.done += 1;
+                    p.pruned += 1;
+                    p.reclaimed += old.allocated_bytes.saturating_sub(new.allocated_bytes);
+                }
+                if let Some(&i) = self.index.get(&old.path) {
+                    self.rows[i] = Row::Done(new);
+                }
+            }
+            DeleteOutcome::Failed { path, verb, error } => {
+                self.warnings += 1;
+                self.last_warning = Some(format!("failed to {verb} {}: {error}", path.display()));
+                self.selected.remove(&path);
+                if let Some(p) = &mut self.delete_progress {
+                    p.done += 1;
+                    p.failures += 1;
                 }
             }
         }
@@ -985,20 +1074,56 @@ impl App {
         let Some(p) = self.delete_progress.take() else {
             return;
         };
-        let ok = p.done - p.failures;
-        self.action = Some(if p.failures == 0 {
-            format!(
-                "Deleted {ok} director{} · reclaimed {}",
-                if ok == 1 { "y" } else { "ies" },
-                self.fmt_size(p.reclaimed)
-            )
+        let removed = p.done - p.failures - p.pruned;
+        let mut done = Vec::new();
+        if removed > 0 {
+            done.push(format!(
+                "deleted {removed} director{}",
+                if removed == 1 { "y" } else { "ies" }
+            ));
+        }
+        if p.pruned > 0 {
+            done.push(format!(
+                "pruned {} store{}",
+                p.pruned,
+                if p.pruned == 1 { "" } else { "s" }
+            ));
+        }
+        let mut msg = if done.is_empty() {
+            "Nothing removed".to_string()
         } else {
+            let done = done.join(", ");
             format!(
-                "Deleted {ok}, {} failed · reclaimed {} · see ⚠",
-                p.failures,
+                "{}{} · reclaimed {}",
+                done[..1].to_uppercase(),
+                &done[1..],
                 self.fmt_size(p.reclaimed)
             )
-        });
+        };
+        if p.failures > 0 {
+            // The last failure's text, so e.g. the prune command to run by
+            // hand is right there instead of only counted.
+            msg = format!(
+                "{msg} · {} failed: {}",
+                p.failures,
+                self.last_warning.as_deref().unwrap_or("see ⚠")
+            );
+        }
+        self.action = Some(msg);
+    }
+
+    /// Whether any marked row is a pnpm store.
+    fn store_marked(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.ecosystem() == pnpm::STORE_ECOSYSTEM && self.selected.contains(r.path()))
+    }
+
+    /// Whether any row (sized or not) is a pnpm store.
+    fn has_store_rows(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|r| r.ecosystem() == pnpm::STORE_ECOSYSTEM)
     }
 
     /// Drop the given paths from the row list (after they were deleted on disk).
@@ -1022,8 +1147,8 @@ impl App {
 
     /// Whether a completed directory passes the active filters.
     fn passes(&self, d: &DependencyDir, now: SystemTime) -> bool {
-        d.size_bytes >= self.min_size
-            && d.size_bytes >= self.size_filter.min_bytes()
+        d.bytes(self.size_mode) >= self.min_size
+            && d.bytes(self.size_mode) >= self.size_filter.min_bytes()
             && !self.disabled_ecos.contains(d.ecosystem)
             && self.age_passes(d.modified, now)
     }
@@ -1096,14 +1221,14 @@ impl App {
             });
         }
         ordered.sort_by(|a, b| {
-            group_total(&b.1)
-                .cmp(&group_total(&a.1))
+            group_total(&b.1, self.size_mode)
+                .cmp(&group_total(&a.1, self.size_mode))
                 .then_with(|| a.0.cmp(b.0))
         });
 
         let mut items = Vec::new();
         for (eco, rows) in ordered {
-            let total = group_total(&rows);
+            let total = group_total(&rows, self.size_mode);
             let count = rows.iter().filter(|r| matches!(r, Row::Done(_))).count();
             let selected = rows
                 .iter()
@@ -1127,7 +1252,7 @@ impl App {
     fn compare(&self, a: &DependencyDir, b: &DependencyDir) -> std::cmp::Ordering {
         use std::cmp::Ordering;
         let ord = match self.sort {
-            SortKey::Size => b.size_bytes.cmp(&a.size_bytes),
+            SortKey::Size => b.bytes(self.size_mode).cmp(&a.bytes(self.size_mode)),
             SortKey::Files => b.file_count.cmp(&a.file_count),
             SortKey::Name => a.name.cmp(b.name),
             // Most-recently modified first; unknown timestamps sort last.
@@ -1155,11 +1280,11 @@ impl App {
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if d.size_bytes >= self.min_size => Some(d.clone()),
+                Row::Done(d) if d.bytes(self.size_mode) >= self.min_size => Some(d.clone()),
                 _ => None,
             })
             .collect();
-        scanner::sort_by_size(&mut done);
+        scanner::sort_by_size(&mut done, self.size_mode);
         if self.top > 0 && done.len() > self.top {
             done.truncate(self.top);
         }
@@ -1412,7 +1537,7 @@ impl App {
         let max_size = items
             .iter()
             .filter_map(|it| match it {
-                DisplayItem::Data(Row::Done(d)) => Some(d.size_bytes),
+                DisplayItem::Data(Row::Done(d)) => Some(d.bytes(self.size_mode)),
                 _ => None,
             })
             .max()
@@ -1420,7 +1545,7 @@ impl App {
 
         // Bar column width derives from the available area (the leading
         // checkbox column and its spacing take a few more cells than before).
-        let bar_width = (area.width as usize).saturating_sub(74).clamp(6, 24);
+        let bar_width = (area.width as usize).saturating_sub(76).clamp(6, 24);
 
         // Collect into an owned Vec so the immutable borrow of `self`/`items`
         // ends before the table is rendered with `&mut self.state` below.
@@ -1438,7 +1563,7 @@ impl App {
 
         let header = TableRow::new(vec![
             Cell::from(""),
-            Cell::from(Text::from("Size").right_aligned()),
+            Cell::from(Text::from(self.size_mode.column_title()).right_aligned()),
             Cell::from(""),
             Cell::from(Text::from("Files").right_aligned()),
             Cell::from("Modified"),
@@ -1449,7 +1574,8 @@ impl App {
 
         let widths = [
             Constraint::Length(1),
-            Constraint::Length(12),
+            // Room for `≤ 12,300 MB ⇄`.
+            Constraint::Length(14),
             Constraint::Length(bar_width as u16),
             Constraint::Length(10),
             Constraint::Length(10),
@@ -1526,7 +1652,7 @@ impl App {
             }
             DisplayItem::Data(Row::Done(d)) => {
                 let frac = if max_size > 0 {
-                    d.size_bytes as f64 / max_size as f64
+                    d.bytes(self.size_mode) as f64 / max_size as f64
                 } else {
                     0.0
                 };
@@ -1536,7 +1662,7 @@ impl App {
                 let mark = if marked { "✓" } else { " " };
                 let row = TableRow::new(vec![
                     Cell::from(mark).style(Style::new().fg(SELECT_FG).bold()),
-                    Cell::from(Text::from(self.fmt_size(d.size_bytes)).right_aligned())
+                    Cell::from(Text::from(self.size_cell(d)).right_aligned())
                         .style(Style::new().fg(color).bold()),
                     Cell::from(build_bar(frac, bar_width)).style(Style::new().fg(color)),
                     Cell::from(Text::from(group_thousands(d.file_count)).right_aligned())
@@ -1586,7 +1712,7 @@ impl App {
             .rows
             .iter()
             .filter_map(|r| match r {
-                Row::Done(d) if self.passes(d, now) => Some(d.size_bytes),
+                Row::Done(d) if self.passes(d, now) => Some(d.bytes(self.size_mode)),
                 _ => None,
             })
             .sum();
@@ -1612,7 +1738,16 @@ impl App {
             Style::new().fg(Color::Gray),
         ));
         chips.text(Span::raw("   "));
-        // sort/group/unit/icons double as click targets for their key actions.
+        // show/sort/group/unit/icons double as click targets for their key
+        // actions.
+        chips.button(
+            vec![Span::styled(
+                format!("show:{}", self.size_mode.label()),
+                Style::new().fg(Color::Green),
+            )],
+            ClickAction::ToggleSizeMode,
+        );
+        chips.text(Span::raw("  "));
         chips.button(
             vec![Span::styled(
                 format!("sort:{}", self.sort.label()),
@@ -1648,6 +1783,22 @@ impl App {
             )],
             ClickAction::CycleIcons,
         );
+        // Only worth a chip once there is a store to act on; then it is
+        // prominent, since one mode removes the whole store.
+        if self.has_store_rows() {
+            chips.text(Span::raw("  "));
+            let style = match self.store_action {
+                StoreAction::Prune => Style::new().fg(Color::Green),
+                StoreAction::Delete => Style::new().fg(Color::Red).bold(),
+            };
+            chips.button(
+                vec![Span::styled(
+                    format!("store:{}", self.store_action.label()),
+                    style,
+                )],
+                ClickAction::ToggleStoreAction,
+            );
+        }
         if self.warnings > 0 {
             chips.text(Span::raw("  "));
             chips.text(Span::styled(
@@ -1655,25 +1806,28 @@ impl App {
                 Style::new().fg(Color::Yellow),
             ));
         }
-        // The transient result of the last action (e.g. a deletion) trails the
-        // chips until the selection changes again.
-        if let Some(msg) = &self.action {
-            chips.text(Span::raw("   "));
-            chips.text(Span::styled(
-                msg.clone(),
-                Style::new().fg(Color::Green).italic(),
-            ));
-        }
+
         // The chips are the first inner footer line (below the top border).
         chips.register(&mut self.clicks, area.x + 1, area.y + 1);
 
         // Two hint rows: view controls on top, the selection/deletion verbs
         // (which the footer chip already advertises with "press d to delete")
         // below.
-        let hints_view = Line::from(vec![Span::styled(
-            "↑/↓ move   S sort   g group   u unit   i icons   ↵ fold",
+        let mut hints_view = Line::from(vec![Span::styled(
+            "↑/↓ move   f freeable/on disk   S sort   g group   u unit   i icons   ↵ fold",
             Style::new().fg(Color::DarkGray),
         )]);
+        let any_shared = self
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Done(d) if d.mostly_shared() && self.passes(d, now)));
+        let shared_legend = Span::styled(
+            "   ⇄ mostly shared — deleting frees little",
+            Style::new().fg(Color::Yellow),
+        );
+        if any_shared && self.action.is_none() {
+            hints_view.push_span(shared_legend.clone());
+        }
         let delete_hint = if sel_count > 0 {
             Span::styled("d delete", Style::new().fg(SELECT_FG).bold())
         } else {
@@ -1687,7 +1841,27 @@ impl App {
             delete_hint,
             Span::styled("   ? help   q quit", Style::new().fg(Color::DarkGray)),
         ]);
+        let mut hints_action = hints_action;
+        // The action message below takes the view-hint line; keep the legend.
+        if any_shared && self.action.is_some() {
+            hints_action.push_span(shared_legend);
+        }
+        if self.snapshots {
+            hints_action.push_span(Span::styled(
+                "   Time Machine snapshots: space may only free up once they expire",
+                Style::new().fg(Color::Yellow),
+            ));
+        }
 
+        // The transient result of the last action (e.g. a deletion) takes the
+        // view-hint line until the selection changes again, so a long one,
+        // such as a prune command to run by hand, stays readable.
+        if let Some(msg) = &self.action {
+            hints_view = Line::from(Span::styled(
+                msg.clone(),
+                Style::new().fg(Color::Green).italic(),
+            ));
+        }
         let text = Text::from(vec![chips.into_line(), hints_view, hints_action]);
         let para = Paragraph::new(text).block(
             Block::default()
@@ -1704,7 +1878,9 @@ impl App {
             help_line("Home / End", "first / last row"),
             Line::raw(""),
             help_line("S", "cycle sort (size · modified · name · files)"),
+            help_line("f", "toggle size shown (freeable · on disk)"),
             help_line("u", "toggle size units (MB · auto)"),
+            help_line("p", "pnpm stores: prune (default) or delete (not pnpm 11)"),
             help_line("i", "cycle ecosystem icons (emoji · nerd · off)"),
             help_line("g", "toggle grouping by ecosystem"),
             help_line("Enter / Space", "fold/unfold selected group"),
@@ -1848,37 +2024,96 @@ impl App {
         let dirs = self.selected_dirs();
         let (count, bytes) = self.selected_total();
 
+        let stores: HashSet<&Path> = self
+            .rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Done(d) if d.kind == DirKind::PnpmStore => Some(d.path.as_path()),
+                _ => None,
+            })
+            .collect();
+        let (store_dirs, other_dirs): (Vec<_>, Vec<_>) =
+            dirs.iter().partition(|(p, _)| stores.contains(p.as_path()));
+        let any_store = !store_dirs.is_empty();
+        let bounded = |p: &Path| freeable_is_upper_bound(DirKind::PnpmStore, p);
+        let any_bound = store_dirs.iter().any(|(p, _)| bounded(p));
+        let prunes = store_dirs
+            .iter()
+            .filter(|(p, _)| store_action_for(p, self.store_action) == StoreAction::Prune)
+            .count();
+        let removals = count.saturating_sub(prunes);
+        let plural =
+            |n: usize, one: &'static str, many: &'static str| if n == 1 { one } else { many };
+        let heading = match (removals, prunes) {
+            (r, 0) => format!(
+                "About to remove {r} {}:",
+                plural(r, "directory", "directories")
+            ),
+            (0, p) => format!("About to prune {p} {}:", plural(p, "store", "stores")),
+            (r, p) => format!(
+                "About to remove {r} {} and prune {p} {}:",
+                plural(r, "directory", "directories"),
+                plural(p, "store", "stores")
+            ),
+        };
+
         // Show a bounded list of paths so a huge selection can't overflow the
-        // screen; the rest is summarised on a trailing line.
+        // screen; the rest is summarised on a trailing line. Stores are always
+        // listed, first, since what happens to them depends on the `p` mode.
         const MAX_LISTED: usize = 10;
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(Span::styled(
-            format!(
-                "About to remove {count} director{}:",
-                if count == 1 { "y" } else { "ies" }
-            ),
+            heading,
             Style::new().fg(Color::White).bold(),
         )));
         lines.push(Line::raw(""));
-        for (path, size) in dirs.iter().take(MAX_LISTED) {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("  {:>9}  ", self.fmt_size(*size)),
-                    Style::new().fg(Color::Gray),
-                ),
-                Span::styled(self.display_path(path), Style::new().fg(Color::White)),
-            ]));
+        for (path, size) in store_dirs.iter().chain(other_dirs.iter().take(MAX_LISTED)) {
+            let mut size = self.fmt_size(*size);
+            if stores.contains(path.as_path()) && bounded(path) {
+                size = format!("≤ {size}");
+            }
+            let mut line = vec![Span::styled(
+                format!("  {size:>9}  "),
+                Style::new().fg(Color::Gray),
+            )];
+            // Say what happens to a store before its (possibly cut off) path.
+            if stores.contains(path.as_path()) {
+                line.push(match store_action_for(path, self.store_action) {
+                    StoreAction::Prune if self.store_action == StoreAction::Delete => Span::styled(
+                        "prune (projects link into it) ",
+                        Style::new().fg(Color::Green).bold(),
+                    ),
+                    StoreAction::Prune => {
+                        Span::styled("prune ", Style::new().fg(Color::Green).bold())
+                    }
+                    StoreAction::Delete => {
+                        Span::styled("DELETE whole store ", Style::new().fg(Color::Red).bold())
+                    }
+                });
+            }
+            line.push(Span::styled(
+                self.display_path(path),
+                Style::new().fg(Color::White),
+            ));
+            lines.push(Line::from(line));
         }
-        if dirs.len() > MAX_LISTED {
+        if other_dirs.len() > MAX_LISTED {
             lines.push(Line::from(Span::styled(
-                format!("  … and {} more", dirs.len() - MAX_LISTED),
+                format!("  … and {} more", other_dirs.len() - MAX_LISTED),
                 Style::new().fg(Color::DarkGray).italic(),
             )));
         }
 
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![
-            Span::styled("Reclaims ", Style::new().fg(Color::Gray)),
+            Span::styled(
+                if any_bound {
+                    "Reclaims up to "
+                } else {
+                    "Reclaims "
+                },
+                Style::new().fg(Color::Gray),
+            ),
             Span::styled(self.fmt_size(bytes), Style::new().fg(Color::Green).bold()),
             Span::styled(" of disk space.", Style::new().fg(Color::Gray)),
         ]));
@@ -1919,6 +2154,23 @@ impl App {
             ],
             ClickAction::ConfirmCancel,
         );
+        if any_store {
+            keys.text(Span::styled("    ", Style::new().fg(Color::Gray)));
+            keys.button(
+                vec![
+                    Span::styled("p ", Style::new().fg(Color::Green).bold()),
+                    match self.store_action {
+                        StoreAction::Prune => {
+                            Span::styled("store: prune", Style::new().fg(Color::Gray))
+                        }
+                        StoreAction::Delete => {
+                            Span::styled("store: DELETE", Style::new().fg(Color::Red).bold())
+                        }
+                    },
+                ],
+                ClickAction::ToggleStoreAction,
+            );
+        }
 
         let keys_index = lines.len();
         let area = centered_rect(frame.area(), 70, (lines.len() + 1) as u16 + 2);
@@ -2004,6 +2256,20 @@ impl App {
         }
     }
 
+    /// A row's size in the current mode, flagged with `⇄` when deleting it
+    /// would free little because most of it is shared outside.
+    fn size_cell(&self, d: &DependencyDir) -> String {
+        let mut size = self.fmt_size(d.bytes(self.size_mode));
+        if self.size_mode == SizeMode::Freeable && freeable_is_upper_bound(d.kind, &d.path) {
+            size = format!("≤ {size}");
+        }
+        if d.mostly_shared() {
+            format!("{size} ⇄")
+        } else {
+            size
+        }
+    }
+
     /// Render a byte count for the size column, honouring the current unit mode.
     fn fmt_size(&self, bytes: u64) -> String {
         match self.size_unit {
@@ -2023,15 +2289,111 @@ impl App {
     }
 }
 
+/// Whether a row's freeable size only bounds what removing it frees: pnpm
+/// 11 projects symlink to packages in a store's `links/`, which the sizing
+/// counts as freeable but `pnpm store prune` keeps.
+fn freeable_is_upper_bound(kind: DirKind, path: &Path) -> bool {
+    kind == DirKind::PnpmStore && pnpm::projects_link_into(path)
+}
+
+/// The view to remember for next time: what the TUI ended on, except that a
+/// setting still at the value a run flag forced keeps its remembered value.
+fn view_to_save(
+    remembered: &ViewState,
+    mut current: ViewState,
+    icons: Option<IconStyle>,
+    size_mode: Option<SizeMode>,
+) -> ViewState {
+    if icons == Some(current.icon_style) {
+        current.icon_style = remembered.icon_style;
+    }
+    if size_mode == Some(current.size_mode) {
+        current.size_mode = remembered.size_mode;
+    }
+    current
+}
+
+/// Delete (or, for a pnpm store that [`store_action_for`] says to prune,
+/// prune) one marked directory, for the deletion worker.
+fn delete_target(dir: DependencyDir, store_action: StoreAction) -> DeleteOutcome {
+    let mut target = dir.path.clone();
+    if dir.kind == DirKind::PnpmStore {
+        if store_action_for(&dir.path, store_action) == StoreAction::Prune {
+            return prune_store(dir);
+        }
+        // Re-checked right before removing: store paths come from files in
+        // the scanned tree, so never remove one that isn't laid out as a store.
+        // Resolved once, so links in the path cannot point the check at one
+        // directory and the removal at another.
+        match dir.path.canonicalize() {
+            Ok(real) if pnpm::looks_like_store(&real) => target = real,
+            Ok(_) => {
+                return DeleteOutcome::Failed {
+                    path: dir.path,
+                    verb: "delete",
+                    error: "does not look like a pnpm store".to_string(),
+                }
+            }
+            Err(e) => {
+                return DeleteOutcome::Failed {
+                    path: dir.path,
+                    verb: "delete",
+                    error: e.to_string(),
+                }
+            }
+        }
+    }
+    match std::fs::remove_dir_all(&target) {
+        Ok(()) => DeleteOutcome::Removed {
+            size: dir.freeable_bytes,
+            path: dir.path,
+        },
+        Err(e) => DeleteOutcome::Failed {
+            path: dir.path,
+            verb: "delete",
+            error: e.to_string(),
+        },
+    }
+}
+
+/// What actually happens to `store` when `chosen` is the store action: a
+/// store whose `links/` projects' `node_modules` point into (pnpm 11) is only
+/// ever pruned, since removing it would break every one of those projects
+/// until its next `pnpm install`.
+fn store_action_for(store: &Path, chosen: StoreAction) -> StoreAction {
+    if pnpm::projects_link_into(store) {
+        StoreAction::Prune
+    } else {
+        chosen
+    }
+}
+
+/// Prune a marked pnpm store and re-measure it, for the deletion worker.
+fn prune_store(old: DependencyDir) -> DeleteOutcome {
+    match pnpm::prune(&old.path) {
+        Ok(()) => {
+            let never = AtomicBool::new(false);
+            let new = scanner::size_store(old.path.clone(), &never);
+            DeleteOutcome::Pruned { old, new }
+        }
+        Err(error) => DeleteOutcome::Failed {
+            path: old.path,
+            verb: "prune",
+            error,
+        },
+    }
+}
+
 fn now() -> SystemTime {
     SystemTime::now()
 }
 
-/// Sum of the done-row sizes in a group (pending rows contribute nothing).
-fn group_total(rows: &[&Row]) -> u64 {
+/// Sum of the done-row sizes in a group by `mode` (pending rows contribute
+/// nothing).
+fn group_total(rows: &[&Row], mode: SizeMode) -> u64 {
     rows.iter()
         .filter_map(|r| match r {
-            Row::Done(d) => Some(d.size_bytes),
+            Row::Done(d) => Some(d.bytes(mode)),
             _ => None,
         })
         .sum()
@@ -2275,7 +2637,9 @@ mod tests {
             path: PathBuf::from("/tmp/c"),
             ecosystem: "Node.js",
             name: "node_modules",
-            size_bytes: 42,
+            kind: DirKind::Dependency,
+            allocated_bytes: 42,
+            freeable_bytes: 42,
             file_count: 3,
             modified: None,
         };
@@ -2290,7 +2654,7 @@ mod tests {
             .find(|r| r.path() == Path::new("/tmp/c"))
             .expect("c row present");
         match c {
-            Row::Done(d) => assert_eq!(d.size_bytes, 42),
+            Row::Done(d) => assert_eq!(d.freeable_bytes, 42),
             Row::Pending { .. } => panic!("c should be sized"),
         }
         assert!(matches!(
@@ -2321,7 +2685,9 @@ mod tests {
             path: PathBuf::from(format!("/tmp/{name}")),
             ecosystem: eco,
             name,
-            size_bytes: size,
+            kind: DirKind::Dependency,
+            allocated_bytes: size,
+            freeable_bytes: size,
             file_count: 1,
             modified: None,
         })
@@ -2359,6 +2725,592 @@ mod tests {
         app.reset_filters();
         assert!(!app.group);
         assert_eq!(count(&app), (0, 2));
+    }
+
+    fn sized_row(name: &'static str, allocated: u64, freeable: u64) -> Row {
+        Row::Done(DependencyDir {
+            path: PathBuf::from(format!("/tmp/{name}")),
+            ecosystem: "Node.js",
+            name: "node_modules",
+            kind: DirKind::Dependency,
+            allocated_bytes: allocated,
+            freeable_bytes: freeable,
+            file_count: 1,
+            modified: None,
+        })
+    }
+
+    fn screen(app: &mut App, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn size_mode_toggle_changes_sort_and_totals() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("a", 100, 90));
+        app.rows.push(sized_row("b", 200, 10));
+        let order = |app: &App| -> Vec<PathBuf> {
+            app.display_items(now())
+                .iter()
+                .filter_map(|it| match it {
+                    DisplayItem::Data(r) => Some(r.path().to_path_buf()),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(app.size_mode, SizeMode::Freeable);
+        assert_eq!(
+            order(&app),
+            [PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")]
+        );
+
+        app.handle_key(KeyCode::Char('f'), KeyModifiers::NONE);
+        assert_eq!(app.size_mode, SizeMode::Allocated);
+        assert_eq!(
+            order(&app),
+            [PathBuf::from("/tmp/b"), PathBuf::from("/tmp/a")]
+        );
+        assert_eq!(app.view_state().size_mode, SizeMode::Allocated);
+    }
+
+    #[test]
+    fn clicking_the_size_mode_chip_toggles_it() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        render(&mut app, 140, 24);
+
+        let (rect, _) = app
+            .clicks
+            .iter()
+            .find(|(_, a)| matches!(a, ClickAction::ToggleSizeMode))
+            .copied()
+            .expect("footer size-mode chip should register a click region");
+
+        app.handle_click(rect.x, rect.y);
+        assert_eq!(app.size_mode, SizeMode::Allocated);
+    }
+
+    #[test]
+    fn deletion_numbers_use_freeable() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.rows.push(sized_row("a", 100, 90));
+        app.size_mode = SizeMode::Allocated;
+        app.selected.insert(PathBuf::from("/tmp/a"));
+        assert_eq!(app.selected_total(), (1, 90));
+        assert_eq!(app.selected_dirs(), [(PathBuf::from("/tmp/a"), 90)]);
+    }
+
+    #[test]
+    fn mostly_shared_rows_show_marker() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("shared", 1000, 10));
+        let out = screen(&mut app, 140, 24);
+        assert!(out.contains("⇄"), "{out}");
+        assert!(out.contains("mostly shared"), "{out}");
+
+        // Nothing shared, nothing to explain.
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("own", 1000, 1000));
+        let out = screen(&mut app, 140, 24);
+        assert!(!out.contains("mostly shared"), "{out}");
+    }
+
+    #[test]
+    fn snapshot_hint_shows_only_with_snapshots() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        assert!(!screen(&mut app, 140, 24).contains("Time Machine"));
+        app.snapshots = true;
+        assert!(screen(&mut app, 140, 24).contains("Time Machine snapshots"));
+    }
+
+    fn store_dir_row(path: PathBuf, allocated: u64, freeable: u64) -> DependencyDir {
+        DependencyDir {
+            path,
+            ecosystem: crate::pnpm::STORE_ECOSYSTEM,
+            name: crate::pnpm::STORE_ECOSYSTEM,
+            kind: DirKind::PnpmStore,
+            allocated_bytes: allocated,
+            freeable_bytes: freeable,
+            file_count: 1,
+            modified: None,
+        }
+    }
+
+    #[test]
+    fn store_chip_only_shows_with_store_rows() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        assert!(!screen(&mut app, 160, 24).contains("store:"));
+
+        app.rows.push(Row::Done(store_dir_row(
+            PathBuf::from("/s/store/v10"),
+            500,
+            200,
+        )));
+        assert!(screen(&mut app, 160, 24).contains("store:prune"));
+        let (rect, _) = app
+            .clicks
+            .iter()
+            .find(|(_, a)| matches!(a, ClickAction::ToggleStoreAction))
+            .copied()
+            .expect("store chip should register a click region");
+
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(app.store_action, StoreAction::Delete);
+        assert!(screen(&mut app, 160, 24).contains("store:delete"));
+
+        app.handle_click(rect.x, rect.y);
+        assert_eq!(app.store_action, StoreAction::Prune);
+    }
+
+    #[test]
+    fn confirm_dialog_names_store_action() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        let store = PathBuf::from("/s/store/v10");
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, 200)));
+        app.selected.insert(store);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::ConfirmDelete));
+
+        let out = screen(&mut app, 140, 30);
+        assert!(out.contains("prune"), "{out}");
+        assert!(!out.contains("DELETE whole store"), "{out}");
+
+        // `p` flips the action from inside the dialog, too.
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(matches!(app.overlay, Overlay::ConfirmDelete));
+        assert!(screen(&mut app, 140, 30).contains("DELETE whole store"));
+    }
+
+    /// A pnpm 11 style store: projects' `node_modules` symlink into `links/`.
+    fn linked_store(tag: &str) -> PathBuf {
+        let tmp = std::env::temp_dir().join(format!("dda-store-{tag}-{}", std::process::id()));
+        let store = tmp.join("v11");
+        std::fs::create_dir_all(store.join("files").join("00")).unwrap();
+        std::fs::create_dir_all(store.join("links")).unwrap();
+        std::fs::write(store.join("index.db"), b"").unwrap();
+        store
+    }
+
+    #[test]
+    fn stores_projects_link_into_are_only_ever_pruned() {
+        let store = linked_store("linked-action");
+        assert_eq!(
+            store_action_for(&store, StoreAction::Delete),
+            StoreAction::Prune
+        );
+        assert_eq!(
+            store_action_for(&store, StoreAction::Prune),
+            StoreAction::Prune
+        );
+        std::fs::remove_dir_all(store.join("links")).unwrap();
+        assert_eq!(
+            store_action_for(&store, StoreAction::Delete),
+            StoreAction::Delete
+        );
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    #[test]
+    fn confirm_dialog_never_offers_deleting_a_linked_store() {
+        let store = linked_store("linked-dialog");
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.store_action = StoreAction::Delete;
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, 200)));
+        app.selected.insert(store.clone());
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+
+        let out = screen(&mut app, 160, 30);
+        assert!(!out.contains("DELETE whole store"), "{out}");
+        assert!(out.contains("prune"), "{out}");
+        assert!(out.contains("projects link into it"), "{out}");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    #[test]
+    fn linked_store_freeable_is_shown_as_an_upper_bound() {
+        // Packages projects symlink to count as freeable, yet prune keeps
+        // them, so the figure is only an upper bound.
+        let store = linked_store("linked-bound");
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 900, 800)));
+        assert!(screen(&mut app, 160, 30).contains("≤ "));
+        app.size_mode = SizeMode::Allocated;
+        assert!(!screen(&mut app, 160, 30).contains("≤ "));
+
+        app.size_mode = SizeMode::Freeable;
+        app.selected.insert(store.clone());
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let out = screen(&mut app, 160, 30);
+        assert!(out.contains("Reclaims up to "), "{out}");
+        assert!(out.contains("≤ "), "{out}");
+
+        // Without `links/` prune frees what the row says.
+        std::fs::remove_dir_all(store.join("links")).unwrap();
+        let out = screen(&mut app, 160, 30);
+        assert!(!out.contains("up to"), "{out}");
+        assert!(!out.contains("≤ "), "{out}");
+        let _ = std::fs::remove_dir_all(store.parent().unwrap());
+    }
+
+    /// An app with `projects` marked project rows plus a marked store row.
+    fn marked_projects_and_store(projects: usize, store_freeable: u64) -> App {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        for i in 0..projects {
+            let path = PathBuf::from(format!("/tmp/p{i}/node_modules"));
+            app.rows.push(Row::Done(DependencyDir {
+                path: path.clone(),
+                ecosystem: "Node.js",
+                name: "node_modules",
+                kind: DirKind::Dependency,
+                allocated_bytes: 1_000_000,
+                freeable_bytes: 1_000_000,
+                file_count: 1,
+                modified: None,
+            }));
+            app.selected.insert(path);
+        }
+        let store = PathBuf::from("/s/store/v10");
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, store_freeable)));
+        app.selected.insert(store);
+        app
+    }
+
+    #[test]
+    fn confirm_dialog_lists_stores_beyond_the_listed_limit() {
+        let mut app = marked_projects_and_store(12, 1);
+        app.store_action = StoreAction::Delete;
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let out = screen(&mut app, 160, 40);
+        assert!(out.contains("DELETE whole store"), "{out}");
+        assert!(out.contains("… and 2 more"), "{out}");
+    }
+
+    #[test]
+    fn confirm_dialog_counts_prunes_apart_from_removals() {
+        let mut app = marked_projects_and_store(2, 1);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        let out = screen(&mut app, 160, 40);
+        assert!(
+            out.contains("About to remove 2 directories and prune 1 store:"),
+            "{out}"
+        );
+        app.store_action = StoreAction::Delete;
+        let out = screen(&mut app, 160, 40);
+        assert!(out.contains("About to remove 3 directories:"), "{out}");
+    }
+
+    #[test]
+    fn confirm_dialog_store_button_shows_the_mode() {
+        let mut app = marked_projects_and_store(1, 1);
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        assert!(screen(&mut app, 160, 40).contains("p store: prune"));
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert!(screen(&mut app, 160, 40).contains("p store: DELETE"));
+    }
+
+    #[test]
+    fn store_action_only_toggles_with_a_store_to_act_on() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(done_row("Node.js", "node_modules", 100));
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(app.store_action, StoreAction::Prune);
+
+        // In the dialog only a marked store counts.
+        app.rows.push(Row::Done(store_dir_row(
+            PathBuf::from("/s/store/v10"),
+            500,
+            200,
+        )));
+        app.selected.insert(PathBuf::from("/tmp/node_modules"));
+        app.handle_key(KeyCode::Char('d'), KeyModifiers::NONE);
+        app.handle_key(KeyCode::Char('p'), KeyModifiers::NONE);
+        assert_eq!(app.store_action, StoreAction::Prune);
+    }
+
+    #[test]
+    fn action_message_keeps_the_shared_legend() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.rows.push(sized_row("shared", 1000, 10));
+        app.action = Some("Deleted 1 directory".to_string());
+        let out = screen(&mut app, 200, 24);
+        assert!(out.contains("Deleted 1 directory"), "{out}");
+        assert!(out.contains("mostly shared"), "{out}");
+    }
+
+    #[test]
+    fn run_flags_are_not_saved_as_the_remembered_view() {
+        let remembered = ViewState {
+            icon_style: IconStyle::Emoji,
+            size_mode: SizeMode::Freeable,
+            ..ViewState::default()
+        };
+        // Started with `--icons nerd --size-mode allocated`, nothing toggled.
+        let current = ViewState {
+            icon_style: IconStyle::Nerd,
+            size_mode: SizeMode::Allocated,
+            ..ViewState::default()
+        };
+        let flags = (Some(IconStyle::Nerd), Some(SizeMode::Allocated));
+        let saved = view_to_save(&remembered, current.clone(), flags.0, flags.1);
+        assert_eq!(saved.icon_style, IconStyle::Emoji);
+        assert_eq!(saved.size_mode, SizeMode::Freeable);
+
+        // Changed in the TUI after starting with the flags: that is a choice.
+        let changed = ViewState {
+            icon_style: IconStyle::Off,
+            ..current.clone()
+        };
+        let saved = view_to_save(&remembered, changed, flags.0, flags.1);
+        assert_eq!(saved.icon_style, IconStyle::Off);
+        assert_eq!(saved.size_mode, SizeMode::Freeable);
+
+        // Without flags everything shown is what gets remembered.
+        let saved = view_to_save(&remembered, current, None, None);
+        assert_eq!(saved.icon_style, IconStyle::Nerd);
+        assert_eq!(saved.size_mode, SizeMode::Allocated);
+    }
+
+    #[test]
+    fn prune_failure_keeps_row_and_warns() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        let store = PathBuf::from("/s/store/v10");
+        app.rows
+            .push(Row::Done(store_dir_row(store.clone(), 500, 200)));
+        app.selected.insert(store.clone());
+        app.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total: 1,
+            reclaimed: 0,
+            failures: 0,
+            pruned: 0,
+        });
+
+        app.apply_delete_outcome(DeleteOutcome::Failed {
+            path: store.clone(),
+            verb: "prune",
+            error: "pnpm not found; run: pnpm store prune --store-dir /s/store".to_string(),
+        });
+        app.finish_deletion();
+
+        assert_eq!(app.rows.len(), 1);
+        assert_eq!(app.warnings, 1);
+        let action = app.action.clone().unwrap();
+        assert!(
+            action.contains("pnpm store prune --store-dir /s/store"),
+            "{action}"
+        );
+    }
+
+    /// The message after deleting `removed` directories (100 MB freeable
+    /// each), pruning a store (500 → 320 MB on disk) and a failed prune.
+    fn deletion_message(removed: usize, pruned: bool, failed: bool) -> String {
+        const MB: u64 = 1_000_000;
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        app.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total: removed + usize::from(pruned) + usize::from(failed),
+            reclaimed: 0,
+            failures: 0,
+            pruned: 0,
+        });
+        for i in 0..removed {
+            let path = PathBuf::from(format!("/tmp/p{i}"));
+            app.apply_delete_outcome(DeleteOutcome::Removed {
+                path,
+                size: MB * 100,
+            });
+        }
+        let store = PathBuf::from("/s/store/v10");
+        if pruned {
+            app.apply_delete_outcome(DeleteOutcome::Pruned {
+                old: store_dir_row(store.clone(), MB * 500, MB * 200),
+                new: store_dir_row(store.clone(), MB * 320, MB * 20),
+            });
+        }
+        if failed {
+            app.apply_delete_outcome(DeleteOutcome::Failed {
+                path: store,
+                verb: "prune",
+                error: "no pnpm".to_string(),
+            });
+        }
+        app.finish_deletion();
+        let (a, b) = (app.fmt_size(MB * 180), app.fmt_size(MB * 380));
+        let msg = app.action.unwrap();
+        msg.replace(&a, "<180>").replace(&b, "<380>")
+    }
+
+    #[test]
+    fn deletion_messages_name_what_happened() {
+        assert_eq!(
+            deletion_message(0, true, false),
+            "Pruned 1 store · reclaimed <180>"
+        );
+        assert_eq!(
+            deletion_message(2, true, false),
+            "Deleted 2 directories, pruned 1 store · reclaimed <380>"
+        );
+        assert!(deletion_message(1, false, false).starts_with("Deleted 1 directory · "));
+        assert!(
+            deletion_message(0, false, true).starts_with("Nothing removed · 1 failed: "),
+            "{}",
+            deletion_message(0, false, true)
+        );
+        assert!(deletion_message(0, true, true)
+            .starts_with("Pruned 1 store · reclaimed <180> · 1 failed: "));
+    }
+
+    #[test]
+    fn pruned_store_row_is_replaced_and_counts_reclaimed() {
+        let mut app = App::new(PathBuf::from("/tmp"), 0, 0, ViewState::default());
+        let store = PathBuf::from("/s/store/v10");
+        let old = store_dir_row(store.clone(), 500, 200);
+        app.rows.push(Row::Done(old.clone()));
+        app.rebuild_index();
+        app.selected.insert(store.clone());
+        app.delete_progress = Some(DeleteProgress {
+            done: 0,
+            total: 1,
+            reclaimed: 0,
+            failures: 0,
+            pruned: 0,
+        });
+
+        let new = store_dir_row(store.clone(), 320, 20);
+        app.apply_delete_outcome(DeleteOutcome::Pruned { old, new });
+
+        assert_eq!(app.delete_progress.as_ref().unwrap().reclaimed, 180);
+        assert!(app.selected.is_empty());
+        match &app.rows[0] {
+            Row::Done(d) => assert_eq!(d.allocated_bytes, 320),
+            Row::Pending { .. } => panic!("store row should stay sized"),
+        }
+    }
+
+    #[test]
+    fn delete_mode_refuses_a_dir_that_is_not_a_store() {
+        let tmp = std::env::temp_dir().join(format!("dda-store-keep-{}", std::process::id()));
+        let not_store = tmp.join("v10");
+        std::fs::create_dir_all(&not_store).unwrap();
+        std::fs::write(not_store.join("precious"), b"x").unwrap();
+
+        let mut app = App::new(tmp.clone(), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.store_action = StoreAction::Delete;
+        app.rows
+            .push(Row::Done(store_dir_row(not_store.clone(), 1, 1)));
+        app.selected.insert(not_store.clone());
+
+        app.start_deletion();
+        for _ in 0..1000 {
+            app.drain_deletion();
+            if app.delete_progress.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(not_store.join("precious").exists());
+        assert_eq!(app.warnings, 1);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn deleting_a_store_rechecks_it_strictly() {
+        // `files/` and `projects/` without content buckets: API routes look
+        // like this, and the re-check before removal must refuse them too.
+        let tmp = std::env::temp_dir().join(format!("dda-store-route-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let route = tmp.join("api").join("v10");
+        std::fs::create_dir_all(route.join("files").join("[id]")).unwrap();
+        std::fs::create_dir_all(route.join("projects")).unwrap();
+        std::fs::write(route.join("files").join("route.ts"), b"x").unwrap();
+
+        let outcome = delete_target(store_dir_row(route.clone(), 1, 1), StoreAction::Delete);
+
+        assert!(matches!(outcome, DeleteOutcome::Failed { .. }));
+        assert!(route.join("files").join("route.ts").exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deleting_a_linked_store_checks_and_removes_the_same_dir() {
+        // The scan accepts a store by its resolved path, so deletion must
+        // resolve it once too and check and remove that one directory.
+        let tmp = std::env::temp_dir().join(format!("dda-store-link-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let store = tmp.join("real").join("v10");
+        std::fs::create_dir_all(store.join("files").join("00")).unwrap();
+        std::fs::create_dir_all(store.join("index").join("00")).unwrap();
+        let link = tmp.join("link");
+        std::os::unix::fs::symlink(&store, &link).unwrap();
+
+        let outcome = delete_target(store_dir_row(link.clone(), 1, 1), StoreAction::Delete);
+
+        match outcome {
+            DeleteOutcome::Removed { path, .. } => assert_eq!(path, link),
+            DeleteOutcome::Failed { error, .. } => panic!("not removed: {error}"),
+            DeleteOutcome::Pruned { .. } => panic!("pruned instead of deleted"),
+        }
+        assert!(!store.exists());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn delete_mode_removes_store_dir() {
+        let tmp = std::env::temp_dir().join(format!("dda-store-del-{}", std::process::id()));
+        let store = tmp.join("v10");
+        std::fs::create_dir_all(store.join("files").join("00")).unwrap();
+        std::fs::create_dir_all(store.join("index").join("00")).unwrap();
+        std::fs::write(store.join("files").join("00").join("blob"), b"x").unwrap();
+
+        let mut app = App::new(tmp.clone(), 0, 0, ViewState::default());
+        app.scanning = false;
+        app.store_action = StoreAction::Delete;
+        app.rows.push(Row::Done(store_dir_row(store.clone(), 1, 1)));
+        app.selected.insert(store.clone());
+
+        app.start_deletion();
+        for _ in 0..1000 {
+            app.drain_deletion();
+            if app.delete_progress.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(app.delete_progress.is_none(), "deletion did not finish");
+        assert!(!store.exists());
+        assert!(app.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
@@ -2459,7 +3411,9 @@ mod tests {
             path: victim.clone(),
             ecosystem: "Node.js",
             name: "node_modules",
-            size_bytes: 5,
+            kind: DirKind::Dependency,
+            allocated_bytes: 5,
+            freeable_bytes: 5,
             file_count: 1,
             modified: None,
         }));
